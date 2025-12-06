@@ -35,9 +35,3 @@ numpy - for numerical computations
 scipy - for optimization routines
 matplotlib - for visualization
 scikit-fem (version 11.0.0) - for FEM implementation and evaluation
-
-### Usage
-Run the main script:
-```
-python fem_lssvr_1d_poisson.py
-```
