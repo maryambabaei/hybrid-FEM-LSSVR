@@ -337,11 +337,88 @@ def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     # [ I + gamma*A^T*A    C^T ] [w] = [gamma*A^T*b_pde]
     # [ C                   0   ] [μ]   [b_bc]
     
-    # Solve the LSSVR system using advanced solver
-    try:
-        solution, method_used = solve_lssvr_system(A, C, b_pde, b_bc, M, gamma)
-        print(f"LSSVR solver used: {method_used}")
-        
+    kkt_matrix = np.block([
+        [np.eye(M) + gamma * A.T @ A, C.T],
+        [C, np.zeros((2, 2))]
+    ])
+    
+    kkt_rhs = np.concatenate([
+        gamma * A.T @ b_pde,
+        b_bc
+    ])
+    
+def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
+    """
+    Advanced LSSVR system solver with multiple strategies.
+    
+    Returns:
+    - solution: numpy array with [w, mu] where w are coefficients, mu are multipliers
+    - method_used: string describing the method that succeeded
+    """
+    # Build KKT system
+    kkt_matrix = np.block([
+        [np.eye(M) + gamma * A.T @ A, C.T],
+        [C, np.zeros((2, 2))]
+    ])
+    
+    kkt_rhs = np.concatenate([
+        gamma * A.T @ b_pde,
+        b_bc
+    ])
+    
+    # Matrix scaling for better conditioning
+    row_norms = np.sqrt(np.sum(kkt_matrix**2, axis=1))
+    row_norms[row_norms == 0] = 1.0  # Avoid division by zero
+    D_left = np.diag(1.0 / row_norms)
+    kkt_matrix_scaled = D_left @ kkt_matrix
+    kkt_rhs_scaled = D_left @ kkt_rhs
+    
+    # Check conditioning and choose solver strategy
+    cond_num = np.linalg.cond(kkt_matrix_scaled)
+    
+    if cond_num < 1e10:
+        # Well-conditioned: use direct solver
+        try:
+            solution_scaled = solve(kkt_matrix_scaled, kkt_rhs_scaled)
+            return solution_scaled, "direct_scaled"
+        except np.linalg.LinAlgError:
+            pass  # Fall through to other methods
+    
+    if cond_num < 1e12:
+        # Moderately ill-conditioned: try block preconditioning
+        try:
+            H = np.eye(M) + gamma * A.T @ A
+            H_inv_CT = solve(H, C.T)
+            S = -C @ H_inv_CT
+            
+            P = np.block([
+                [np.eye(M), np.zeros((M, 2))],
+                [np.zeros((2, M)), np.linalg.inv(S)]
+            ])
+            
+            kkt_matrix_precond = P @ kkt_matrix_scaled
+            kkt_rhs_precond = P @ kkt_rhs_scaled
+            solution_scaled = solve(kkt_matrix_precond, kkt_rhs_precond)
+            return solution_scaled, "block_preconditioned"
+        except (np.linalg.LinAlgError, ValueError):
+            pass  # Fall through
+    
+    if M > 10:
+        # Large system: try iterative solver
+        try:
+            from scipy.sparse.linalg import gmres
+            solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled, 
+                                        tol=1e-10, maxiter=1000, restart=min(M, 50))
+            if info == 0:
+                return solution_scaled, "gmres_iterative"
+        except ImportError:
+            pass
+    
+    # Final fallback: Tikhonov regularization
+    reg_param = max(1e-8 * np.max(np.abs(kkt_matrix_scaled)), 1e-12)
+    kkt_matrix_reg = kkt_matrix_scaled + reg_param * np.eye(kkt_matrix_scaled.shape[0])
+    solution_scaled = solve(kkt_matrix_reg, kkt_rhs_scaled)
+    return solution_scaled, "tikhonov_regularized"
         w = solution[:M]
         mu = solution[M:M+2]  # Lagrange multipliers for BC
         
@@ -356,7 +433,7 @@ def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
             print(f"Warning: Boundary constraint violation: {max_bc_violation}")
         
     except np.linalg.LinAlgError:
-        print("Warning: All linear solvers failed, using optimization fallback")
+        print("Warning: Linear system singular, using optimization fallback")
         # Fallback to optimization
         return lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
                            is_left_boundary, is_right_boundary, global_domain_range)

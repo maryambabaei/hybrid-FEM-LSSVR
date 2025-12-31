@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.optimize import minimize
+from scipy import integrate
 import matplotlib.pyplot as plt
 from numpy.polynomial.legendre import Legendre, leggauss
 from skfem import *
@@ -195,6 +196,8 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
         print("Using linear interpolation fallback")
         # Return a simple linear function as fallback
         def linear_fallback(x):
+            if xmin == xmax:
+                return u_xmin  # Return constant value if interval has zero length
             return u_xmin + (u_xmax - u_xmin) * (x - xmin) / (xmax - xmin)
         return linear_fallback
     
@@ -206,6 +209,16 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
 
 class FEMLSSVRPrimalSolver:
     def __init__(self, num_fem_nodes=5, lssvr_M=12, lssvr_gamma=1e6, global_domain=(-1, 1)):
+        # Input validation
+        if num_fem_nodes < 2:
+            raise ValueError(f"Number of FEM nodes must be at least 2, got {num_fem_nodes}")
+        if lssvr_M < 2:
+            raise ValueError(f"LSSVR parameter M must be at least 2, got {lssvr_M}")
+        if lssvr_gamma <= 0:
+            raise ValueError(f"LSSVR regularization parameter gamma must be positive, got {lssvr_gamma}")
+        if len(global_domain) != 2 or global_domain[0] >= global_domain[1]:
+            raise ValueError(f"Global domain must be a tuple (xmin, xmax) with xmin < xmax, got {global_domain}")
+        
         self.num_fem_nodes = num_fem_nodes
         self.lssvr_M = lssvr_M
         self.lssvr_gamma = lssvr_gamma
@@ -284,6 +297,8 @@ class FEMLSSVRPrimalSolver:
                 print(f"Error in element {i+1}: {e}")
 
                 def linear_fallback(x):
+                    if x_start == x_end:
+                        return u_left  # Return constant value if interval has zero length
                     return u_left + (u_right - u_left) * (x - x_start) / (x_end - x_start)
                 self.lssvr_functions.append(linear_fallback)
         
@@ -330,17 +345,28 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Run hybrid FEM-LSSVR solver (Dual version).')
     parser.add_argument('--no-plot', action='store_true', help='Skip plotting the results.')
+    parser.add_argument('--M', type=int, default=8, help='LSSVR parameter M (number of training points).')
+    parser.add_argument('--gamma', type=float, default=1e4, help='LSSVR regularization parameter gamma.')
+    parser.add_argument('--elements', type=int, default=25, help='Number of FEM elements (nodes = elements + 1).')
     args = parser.parse_args()
+    
+    # Parameter validation
+    if args.M < 2:
+        raise ValueError(f"LSSVR parameter M must be at least 2, got {args.M}")
+    if args.gamma <= 0:
+        raise ValueError(f"LSSVR regularization parameter gamma must be positive, got {args.gamma}")
+    if args.elements < 1:
+        raise ValueError(f"Number of elements must be at least 1, got {args.elements}")
     
     # Initialize performance monitoring
     monitor.reset()
     
     # Parameters
-    num_nodes = 25
+    num_nodes = args.elements + 1
     test_points = np.linspace(-1, 1, 201)
     
     # Solve using hybrid method with primal LSSVR
-    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=8, lssvr_gamma=1e4, global_domain=(-1, 1))
+    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, global_domain=(-1, 1))
     solver.solve()
     
     # Evaluate solution
@@ -350,7 +376,7 @@ if __name__ == "__main__":
     # Calculate errors
     error = np.abs(computed_solution - exact_solution)
     max_error = np.max(error)
-    l2_error = np.sqrt(np.trapz(error**2, test_points))
+    l2_error = np.sqrt(integrate.trapezoid(error**2, test_points))
     print(f"Max error: {max_error:.6f}")
     print(f"L2 error: {l2_error:.6f}")
     
