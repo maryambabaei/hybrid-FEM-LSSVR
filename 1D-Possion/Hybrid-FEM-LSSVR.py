@@ -1398,7 +1398,7 @@ if __name__ == "__main__":
     parser.add_argument('--M', type=int, default=8, help='LSSVR parameter M (number of training points).')
     parser.add_argument('--gamma', type=float, default=1e4, help='LSSVR regularization parameter gamma.')
     parser.add_argument('--elements', type=int, default=25, help='Number of FEM elements (nodes = elements + 1).')
-    parser.add_argument('--solution-order', type=int, default=8, help='Order n of the oscillatory solution sin(nπx).')
+    parser.add_argument('--solution-order', type=int, default=1, help='Order n of the oscillatory solution sin(nπx).')
     args = parser.parse_args()
     
     # Parameter validation
