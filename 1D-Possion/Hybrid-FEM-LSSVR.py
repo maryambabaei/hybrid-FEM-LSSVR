@@ -352,13 +352,150 @@ def solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma):
     kkt_rhs = np.concatenate([gamma * ATb, b_bc])
 
     try:
-        # Try sparse direct solver
+        # Try sparse direct solver first
         solution = spsolve(kkt_matrix_sparse, kkt_rhs)
         return solution, "sparse_direct"
     except Exception as e:
-        print(f"Sparse solver failed ({e}), falling back to dense solver")
-        # Fall back to dense solver
-        return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+        print(f"Sparse direct solver failed ({e}), trying iterative methods")
+
+    # Try preconditioned conjugate gradients for larger systems
+    try:
+        from scipy.sparse.linalg import cg
+
+        # Simple diagonal preconditioner for the main block
+        H_diag = np.diag(main_block)
+        H_diag[H_diag == 0] = 1.0  # Avoid division by zero
+        M_precond = np.concatenate([1.0/H_diag, [1.0, 1.0]])  # Extend for constraints
+
+        def precond_solver(r):
+            return r * M_precond
+
+        solution, info = cg(kkt_matrix_sparse, kkt_rhs, M=precond_solver,
+                          tol=1e-10, maxiter=min(200, M*2))
+
+        if info == 0:
+            return solution, "sparse_cg_preconditioned"
+        else:
+            print(f"CG failed to converge: info={info}")
+
+    except Exception as e:
+        print(f"Preconditioned CG failed: {e}")
+
+    # Final fallback: dense solver
+    print("All sparse solvers failed, falling back to dense solver")
+    return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+
+def preconditioned_conjugate_gradient(A, b, max_iter=500, tol=1e-8):
+    """
+    Preconditioned Conjugate Gradient solver for symmetric positive definite systems.
+
+    Uses a block-diagonal preconditioner exploiting the KKT structure.
+    """
+    n = len(b)
+    M = n - 2  # Size of main block
+
+    # Extract blocks for preconditioner construction
+    H = A[:M, :M]  # Main block
+    C = A[M:M+2, :M]  # Constraint matrix
+    CT = A[:M, M:M+2]  # Constraint transpose
+
+    # Build block preconditioner
+    try:
+        # Preconditioner: P = [H, 0; 0, S_inv] where S = -C*H^{-1}*C^T
+        H_inv_CT = solve(H, CT)
+        S = -C @ H_inv_CT
+        S_inv = np.linalg.inv(S)
+
+        # Construct preconditioner matrix
+        P = np.zeros((n, n))
+        P[:M, :M] = np.eye(M)  # Identity for main block (H is already preconditioned)
+        P[M:M+2, M:M+2] = S_inv
+
+        # Preconditioned CG
+        x = np.zeros(n)
+        r = b - A @ x
+        z = P @ r
+        p = z.copy()
+        rz_old = r @ z
+
+        for iteration in range(max_iter):
+            Ap = A @ p
+            alpha = rz_old / (p @ Ap)
+            x = x + alpha * p
+            r = r - alpha * Ap
+
+            residual_norm = np.linalg.norm(r)
+            if residual_norm < tol:
+                return x, f"converged_iter_{iteration+1}"
+
+            z = P @ r
+            rz_new = r @ z
+            beta = rz_new / rz_old
+            p = z + beta * p
+            rz_old = rz_new
+
+        return x, f"max_iter_{max_iter}"
+
+    except np.linalg.LinAlgError:
+        # Fallback to simple diagonal preconditioner
+        diag_A = np.diag(A)
+        diag_A[diag_A == 0] = 1.0
+        P_diag = 1.0 / diag_A
+
+        x = np.zeros(n)
+        r = b - A @ x
+        z = P_diag * r
+        p = z.copy()
+        rz_old = r @ z
+
+        for iteration in range(max_iter):
+            Ap = A @ p
+            alpha = rz_old / (p @ Ap)
+            x = x + alpha * p
+            r = r - alpha * Ap
+
+            residual_norm = np.linalg.norm(r)
+            if residual_norm < tol:
+                return x, f"diag_converged_iter_{iteration+1}"
+
+            z = P_diag * r
+            rz_new = r @ z
+            if rz_new < tol:
+                break
+            beta = rz_new / rz_old
+            p = z + beta * p
+            rz_old = rz_new
+
+        return x, f"diag_max_iter_{max_iter}"
+
+def iterative_refinement(A, b, x0, max_iter=3, tol=1e-12):
+    """
+    Iterative refinement to improve solution accuracy for well-conditioned systems.
+
+    Solves A * x = b using the initial guess x0 and iteratively corrects
+    the solution based on the residual r = b - A*x.
+    """
+    x = x0.copy()
+    n = len(b)
+
+    for iteration in range(max_iter):
+        # Compute residual: r = b - A*x
+        residual = b - A @ x
+
+        # Check convergence
+        residual_norm = np.linalg.norm(residual)
+        if residual_norm < tol:
+            break
+
+        # Solve correction: A * dx = r
+        try:
+            dx = solve(A, residual)
+            x = x + dx
+        except np.linalg.LinAlgError:
+            # If correction fails, return current solution
+            break
+
+    return x
 
 def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
     """
@@ -396,7 +533,13 @@ def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
     if cond_num < 1e10:
         try:
             solution_scaled = solve(kkt_matrix_scaled, kkt_rhs_scaled)
-            return solution_scaled, "direct_scaled"
+
+            # Iterative refinement for well-conditioned systems
+            if cond_num < 1e6:
+                solution_scaled = iterative_refinement(kkt_matrix_scaled, kkt_rhs_scaled,
+                                                     solution_scaled, max_iter=3, tol=1e-12)
+
+            return solution_scaled, "direct_scaled_refined"
         except np.linalg.LinAlgError:
             pass  # Fall through to other methods
 
@@ -418,10 +561,25 @@ def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
             solution_precond = solve(kkt_matrix_precond, kkt_rhs_precond)
             solution_scaled = P @ solution_precond
 
-            return solution_scaled, "block_preconditioned"
+            # Iterative refinement for block preconditioned solution
+            if cond_num < 1e8:
+                solution_scaled = iterative_refinement(kkt_matrix_scaled, kkt_rhs_scaled,
+                                                     solution_scaled, max_iter=2, tol=1e-10)
+
+            return solution_scaled, "block_preconditioned_refined"
 
         except np.linalg.LinAlgError:
             pass
+
+    # For very large or ill-conditioned systems, try preconditioned conjugate gradients
+    if M > 15 or cond_num > 1e10:
+        try:
+            solution_scaled, method = preconditioned_conjugate_gradient(
+                kkt_matrix_scaled, kkt_rhs_scaled, max_iter=min(500, M*5), tol=1e-8
+            )
+            return solution_scaled, f"pcg_{method}"
+        except Exception as e:
+            print(f"PCG failed: {e}")
 
     # Final fallback: iterative solver with block preconditioning
     try:
