@@ -107,11 +107,13 @@ class PerformanceMonitor:
 # Global performance monitor
 monitor = PerformanceMonitor()
 
-def true_solution(x):
-    return np.sin(np.pi * x)
+def true_solution(x, n=8):
+    # Higher order oscillation with configurable order n
+    return np.sin(n * np.pi * x)
 
-def poisson_rhs(x):
-    return np.pi**2 * np.sin(np.pi * x)
+def poisson_rhs(x, n=8):
+    # RHS for -u'' = f, so f = (nπ)² * sin(nπx)
+    return (n * np.pi)**2 * np.sin(n * np.pi * x)
 
 def main_boundary_condition_left(x):
     return 0.0  # u(-1) = 0
@@ -1103,7 +1105,7 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     return u_lssvr
 
 class FEMLSSVRPrimalSolver:
-    def __init__(self, num_fem_nodes=5, lssvr_M=12, lssvr_gamma=1e6, global_domain=(-1, 1)):
+    def __init__(self, num_fem_nodes=5, lssvr_M=12, lssvr_gamma=1e6, global_domain=(-1, 1), solution_order=8):
         # Input validation
         if num_fem_nodes < 2:
             raise ValueError(f"Number of FEM nodes must be at least 2, got {num_fem_nodes}")
@@ -1118,6 +1120,7 @@ class FEMLSSVRPrimalSolver:
         self.lssvr_M = lssvr_M
         self.lssvr_gamma = lssvr_gamma
         self.global_domain = global_domain
+        self.solution_order = solution_order
         self.fem_nodes = None
         self.fem_values = None
         self.lssvr_functions = []
@@ -1135,13 +1138,13 @@ class FEMLSSVRPrimalSolver:
         # Define bilinear and linear forms
         @BilinearForm
         def laplace(u, v, _):
-            return -dot(grad(u), grad(v))
+            return dot(grad(u), grad(v))
         
         @LinearForm
         def load(v, w):
             x = w.x[0]
-            return -(np.pi**2) * np.sin(np.pi * x) * v
-        
+            return poisson_rhs(x, self.solution_order) * v
+                
         # Assemble and solve
         A = laplace.assemble(basis)
         b = load.assemble(basis)
@@ -1161,7 +1164,7 @@ class FEMLSSVRPrimalSolver:
         # Compute FEM error for reference
         test_points_fem = np.linspace(self.global_domain[0], self.global_domain[1], 201)
         fem_solution_at_test = interpolator(test_points_fem.reshape(1, -1)).flatten()
-        exact_at_test = true_solution(test_points_fem)
+        exact_at_test = true_solution(test_points_fem, self.solution_order)
         fem_error = np.abs(fem_solution_at_test - exact_at_test)
         fem_max_error = np.max(fem_error)
         fem_l2_error = np.sqrt(integrate.trapezoid(fem_error**2, test_points_fem))
@@ -1298,7 +1301,7 @@ class FEMLSSVRPrimalSolver:
         # Vectorized RHS computation across all elements
         f_vals_batch = np.zeros((batch_size, n_training_per_element))
         for i in range(batch_size):
-            f_vals_batch[i, :] = poisson_rhs(training_points_batch[i, :])
+            f_vals_batch[i, :] = poisson_rhs(training_points_batch[i, :], self.solution_order)
         
         # Vectorized boundary condition computation
         b_bc_batch = np.zeros((batch_size, 2))
@@ -1395,6 +1398,7 @@ if __name__ == "__main__":
     parser.add_argument('--M', type=int, default=8, help='LSSVR parameter M (number of training points).')
     parser.add_argument('--gamma', type=float, default=1e4, help='LSSVR regularization parameter gamma.')
     parser.add_argument('--elements', type=int, default=25, help='Number of FEM elements (nodes = elements + 1).')
+    parser.add_argument('--solution-order', type=int, default=8, help='Order n of the oscillatory solution sin(nπx).')
     args = parser.parse_args()
     
     # Parameter validation
@@ -1413,12 +1417,12 @@ if __name__ == "__main__":
     test_points = np.linspace(-1, 1, 201)
     
     # Solve using hybrid method with primal LSSVR
-    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, global_domain=(-1, 1))
+    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, global_domain=(-1, 1), solution_order=args.solution_order)
     solver.solve()
     
     # Evaluate solution
     computed_solution = solver.evaluate_solution(test_points)
-    exact_solution = true_solution(test_points)
+    exact_solution = true_solution(test_points, args.solution_order)
     
     # Calculate errors
     error = np.abs(computed_solution - exact_solution)
