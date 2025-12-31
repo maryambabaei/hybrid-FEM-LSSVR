@@ -706,7 +706,7 @@ class FEMLSSVRPrimalSolver:
             
             element_time = time.time() - element_start
             element_times.append(element_time)
-            monitor.record_operation(f'Element_{i+1}', element_time, f'range=[{x_start:.3f}, {x_end:.3f}]')
+            # Removed individual element timing recording for cleaner output
         
         lssvr_time = time.time() - lssvr_start
         monitor.lssvr_total_time = lssvr_time
