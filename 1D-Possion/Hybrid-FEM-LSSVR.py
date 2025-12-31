@@ -38,7 +38,7 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     global_xmin, global_xmax = global_domain_range
     
     # Training points for PDE constraints
-    training_points = np.linspace(xmin, xmax, 12)
+    training_points = np.linspace(xmin, xmax, 8)
     n_interior = len(training_points)
     
     def residual(u, x):
@@ -215,6 +215,13 @@ if __name__ == "__main__":
     # Evaluate solution
     computed_solution = solver.evaluate_solution(test_points)
     exact_solution = true_solution(test_points)
+    
+    # Calculate errors
+    error = np.abs(computed_solution - exact_solution)
+    max_error = np.max(error)
+    l2_error = np.sqrt(np.trapezoid(error**2, test_points))
+    print(f"Max error: {max_error:.6f}")
+    print(f"L2 error: {l2_error:.6f}")
     
     if not args.no_plot:
         # plot of solution
