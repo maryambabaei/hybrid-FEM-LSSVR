@@ -316,20 +316,59 @@ def gauss_lobatto_points(n_points, domain=(-1, 1)):
     
     return transformed_points
 
-def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
+def solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma):
     """
-    Optimized LSSVR system solver with improved performance and vectorization.
+    Sparse KKT solver for LSSVR systems using structured matrix representations.
 
-    Returns:
-    - solution: numpy array with [w, mu] where w are coefficients, mu are multipliers
-    - method_used: string describing the method that succeeded
+    The KKT matrix has a specific block structure that can be exploited:
+    [ I + γAᵀA    Cᵀ ]
+    [ C            0  ]
+
+    This function uses sparse representations and block algorithms for efficiency.
+    """
+    from scipy.sparse import csr_matrix, bmat
+    from scipy.sparse.linalg import spsolve
+
+    # Pre-compute common matrices
+    ATA = A.T @ A  # Dense but often small
+    ATb = A.T @ b_pde
+
+    # Main block: I + gamma*A^T*A
+    main_block = np.eye(M) + gamma * ATA
+
+    # Create sparse blocks
+    H_sparse = csr_matrix(main_block)  # Main block (potentially dense)
+    CT_sparse = csr_matrix(C.T)        # Constraint transpose
+    C_sparse = csr_matrix(C)           # Constraint matrix
+    zero_block = csr_matrix((2, 2))    # Zero block
+
+    # Build sparse KKT matrix using block structure
+    kkt_matrix_sparse = bmat([
+        [H_sparse, CT_sparse],
+        [C_sparse, zero_block]
+    ], format='csr')
+
+    # Build RHS vector
+    kkt_rhs = np.concatenate([gamma * ATb, b_bc])
+
+    try:
+        # Try sparse direct solver
+        solution = spsolve(kkt_matrix_sparse, kkt_rhs)
+        return solution, "sparse_direct"
+    except Exception as e:
+        print(f"Sparse solver failed ({e}), falling back to dense solver")
+        # Fall back to dense solver
+        return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+
+def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
+    """
+    Dense KKT solver with optimized block algorithms (original implementation).
     """
     # Pre-compute common matrices to avoid redundant calculations
     ATA = A.T @ A  # This is used in multiple places
     ATb = A.T @ b_pde
 
     # Build KKT system more efficiently
-    # Main block: I + gamma*A^T*A
     main_block = np.eye(M) + gamma * ATA
 
     # Build full KKT matrix
@@ -337,7 +376,6 @@ def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
     kkt_matrix[:M, :M] = main_block
     kkt_matrix[:M, M:M+2] = C.T
     kkt_matrix[M:M+2, :M] = C
-    # Bottom-right 2x2 block remains zeros
 
     kkt_rhs = np.zeros(M + 2)
     kkt_rhs[:M] = gamma * ATb
@@ -365,41 +403,79 @@ def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
     # For moderately ill-conditioned systems, try optimized block preconditioning
     if cond_num < 1e12:
         try:
-            # Pre-compute H and its inverse times C.T
-            H = main_block  # Already computed above
+            H = main_block
             H_inv_CT = solve(H, C.T)
             S = -C @ H_inv_CT
-
-            # Build preconditioner more efficiently
             S_inv = np.linalg.inv(S)
+
             P = np.zeros((M + 2, M + 2))
             P[:M, :M] = np.eye(M)
             P[M:M+2, M:M+2] = S_inv
 
-            # Apply preconditioner
             kkt_matrix_precond = P @ kkt_matrix_scaled
             kkt_rhs_precond = P @ kkt_rhs_scaled
-            solution_scaled = solve(kkt_matrix_precond, kkt_rhs_precond)
-            return solution_scaled, "block_preconditioned"
-        except (np.linalg.LinAlgError, ValueError):
-            pass  # Fall through
 
-    # For very ill-conditioned systems, try iterative solver
-    if M > 10:
-        try:
-            from scipy.sparse.linalg import gmres
-            solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled,
-                                        tol=1e-10, maxiter=min(100, M), restart=min(M, 50))
-            if info == 0:
-                return solution_scaled, "gmres_iterative"
-        except ImportError:
+            solution_precond = solve(kkt_matrix_precond, kkt_rhs_precond)
+            solution_scaled = P @ solution_precond
+
+            return solution_scaled, "block_preconditioned"
+
+        except np.linalg.LinAlgError:
             pass
 
-    # Final fallback: Tikhonov regularization
-    reg_param = max(1e-8 * np.max(np.abs(kkt_matrix_scaled)), 1e-12)
-    kkt_matrix_reg = kkt_matrix_scaled + reg_param * np.eye(kkt_matrix_scaled.shape[0])
-    solution_scaled = solve(kkt_matrix_reg, kkt_rhs_scaled)
-    return solution_scaled, "tikhonov_regularized"
+    # Final fallback: iterative solver with block preconditioning
+    try:
+        from scipy.sparse.linalg import gmres
+
+        H = main_block
+        H_inv_CT = solve(H, C.T)
+        S = -C @ H_inv_CT
+        S_inv = np.linalg.inv(S)
+
+        def block_preconditioner(r):
+            r1 = r[:M]
+            r2 = r[M:M+2]
+            y1 = solve(H, r1)
+            y2 = S_inv @ (r2 - C @ y1)
+            return np.concatenate([y1, y2])
+
+        solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled,
+                                    M=block_preconditioner, rtol=1e-10, maxiter=1000)
+
+        if info == 0:
+            return solution_scaled, "iterative_block_preconditioned"
+        else:
+            print(f"GMRES failed to converge: info={info}")
+
+    except Exception as e:
+        print(f"Iterative solver failed: {e}")
+
+    # Ultimate fallback: least squares solution
+    try:
+        solution_ls = np.linalg.lstsq(kkt_matrix_scaled, kkt_rhs_scaled, rcond=None)[0]
+        return solution_ls, "least_squares_fallback"
+    except:
+        raise RuntimeError("All LSSVR solvers failed - this should not happen")
+
+def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
+    """
+    Unified LSSVR system solver with automatic method selection.
+
+    Tries sparse representations first for larger systems, falls back to dense optimized solvers.
+    """
+    # For small systems, dense solver is more efficient
+    if M <= 10:
+        return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+    else:
+        # Try sparse first for larger systems
+        try:
+            return solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma)
+        except ImportError:
+            # scipy.sparse not available
+            return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+        except Exception as e:
+            print(f"Sparse solver failed: {e}, using dense solver")
+            return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
 
 def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
                        is_left_boundary=False, is_right_boundary=False, 
