@@ -21,6 +21,12 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Impact**: Eliminates iterative optimization, providing exact solution in one linear algebra operation
 - **Implementation**: Built constraint matrices for PDE (second derivatives) and boundary conditions, solved the saddle-point system directly
 
+### 5. Attempted JIT Compilation with Numba
+- **Attempted**: Implemented JIT-compiled Legendre polynomial evaluation using Numba
+- **Result**: No performance improvement observed, slight degradation in some cases
+- **Reason**: The evaluation step is already well-vectorized with NumPy, and matrix building/solving dominates the runtime
+- **Conclusion**: JIT compilation not beneficial for this particular implementation
+
 ## Performance Comparison
 
 ### Version 1: Initial Vectorized Version (12 training points)
@@ -37,6 +43,12 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Accuracy**: Max error: 0.000011, L2 error: 0.000005 (maintained high accuracy)
 - **Improvement**: ~36% reduction from Version 2 (from 0.556s to 0.356s), ~53% from Version 1
 - **Note**: Direct solver provides exact solution without iterative optimization, leading to more consistent timing
+
+### Version 4: With Numba JIT (Attempted)
+- **Execution Time**: Average ~0.45 seconds (real time), variable performance
+- **Accuracy**: Maintained
+- **Improvement**: No significant improvement over Version 3
+- **Note**: JIT compilation did not provide benefits for this implementation
 
 ### Previous Version (Before Vectorization)
 - **Execution Time**: Approximately 1.72 seconds (measured with cProfile on computation-only run, excluding plotting)
@@ -66,5 +78,6 @@ This document summarizes the performance profiling and optimizations applied to 
 The optimizations successfully improved performance by:
 1. Vectorizing NumPy operations to leverage compiled C code instead of Python loops.
 2. Reducing the number of training points in LSSVR while maintaining accuracy.
+3. Replacing iterative optimization with direct linear algebra solution of the KKT system.
 
-This results in a ~67% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.556s), making the method more efficient for larger-scale problems. The accuracy remains excellent with max errors on the order of 10^-6.
+This results in a ~79% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.356s), making the method more efficient for larger-scale problems. The accuracy remains excellent with max errors on the order of 10^-5. JIT compilation was attempted but did not provide additional benefits for this implementation.
