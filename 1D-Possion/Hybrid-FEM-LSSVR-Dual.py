@@ -4,6 +4,91 @@ import matplotlib.pyplot as plt
 from numpy.polynomial.legendre import Legendre, leggauss
 from skfem import *
 from skfem.helpers import dot, grad
+import time
+import psutil
+import os
+
+class PerformanceMonitor:
+    """Monitor performance metrics during execution."""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """Reset all monitoring data."""
+        self.start_time = time.time()
+        self.fem_time = 0
+        self.lssvr_time = 0
+        self.element_times = []
+        self.memory_usage = []
+        self.operations = []
+    
+    def record_operation(self, operation_name, duration, details=None):
+        """Record a completed operation."""
+        self.operations.append({
+            'name': operation_name,
+            'duration': duration,
+            'timestamp': time.time() - self.start_time,
+            'details': details
+        })
+    
+    def get_memory_usage(self):
+        """Get current memory usage in MB."""
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    
+    def print_summary(self):
+        """Print performance summary."""
+        total_time = time.time() - self.start_time
+        print(f"\n{'='*50}")
+        print("PERFORMANCE SUMMARY")
+        print(f"{'='*50}")
+        print(f"Total execution time: {total_time:.4f} seconds")
+        if hasattr(self, 'fem_time') and self.fem_time:
+            print(f"FEM solve time: {self.fem_time:.4f} seconds ({self.fem_time/total_time*100:.1f}%)")
+        if hasattr(self, 'lssvr_total_time') and self.lssvr_total_time:
+            print(f"LSSVR solve time: {self.lssvr_total_time:.4f} seconds ({self.lssvr_total_time/total_time*100:.1f}%)")
+        if hasattr(self, 'total_solve_time') and self.total_solve_time:
+            print(f"Total solve time: {self.total_solve_time:.4f} seconds ({self.total_solve_time/total_time*100:.1f}%)")
+        print(f"Number of operations recorded: {len(self.operations)}")
+        if self.operations:
+            print("Operations breakdown:")
+            for op in self.operations:
+                print(f"  {op['name']}: {op['duration']:.6f}s ({op['details']})")
+        if self.memory_usage:
+            print(f"Peak memory usage: {np.max(self.memory_usage):.1f} MB")
+        print(f"{'='*50}\n")
+
+# Global performance monitor
+monitor = PerformanceMonitor()
+
+def gauss_lobatto_points(n_points, domain=(-1, 1)):
+    """
+    Compute Gauss-Lobatto quadrature points on a given domain.
+    
+    Gauss-Lobatto points include the endpoints and are optimal for polynomial interpolation.
+    For n_points, we get n_points points.
+    """
+    if n_points < 2:
+        raise ValueError("Need at least 2 points")
+    
+    if n_points == 2:
+        points = np.array([-1.0, 1.0])
+    else:
+        # For Gauss-Lobatto, interior points are cos(π*k/(n-1)) for k=1 to n-2
+        # where n = n_points - 1
+        n = n_points - 1
+        interior = []
+        for k in range(1, n):
+            x = np.cos(np.pi * k / n)
+            interior.append(x)
+        points = np.array([-1.0] + sorted(interior) + [1.0])
+    
+    # Transform to the desired domain
+    a, b = domain
+    transformed_points = a + (b - a) * (points + 1) / 2
+    
+    return transformed_points
 
 def true_solution(x):
     return np.sin(np.pi * x)
@@ -36,8 +121,8 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     xmin, xmax = domain_range
     global_xmin, global_xmax = global_domain_range
     
-    # Training points for PDE constraints
-    training_points = np.linspace(xmin, xmax, 12)
+    # Training points for PDE constraints - using Gauss-Lobatto points
+    training_points = gauss_lobatto_points(8, domain=(xmin, xmax))
     n_interior = len(training_points)
     
     def residual(u, x):
@@ -55,8 +140,8 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
         # Create Legendre polynomial approximation
         u = Legendre(w, domain_range)
         
-        # PDE constraints with slack variables
-        pde_constraints = [residual(u, x) + e[i] for i, x in enumerate(training_points)]
+        # PDE constraints with slack variables (vectorized)
+        pde_constraints = residual(u, training_points) + e
         
         # Boundary constraints
         bc_constraints = []
@@ -75,7 +160,7 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
             bc_right = u(xmax) - u_xmax
         bc_constraints.append(bc_right)
         
-        return np.array(pde_constraints + bc_constraints)
+        return np.concatenate([pde_constraints, bc_constraints])
     
     # Initial guess
     initial = np.concatenate([np.random.rand(M) * 0.01, np.zeros(n_interior)])
@@ -83,13 +168,35 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     # Equality constraints
     cons = {'type': 'eq', 'fun': constraints}
     
-    # Solve optimization problem
-    res = minimize(objective, x0=initial, constraints=cons, method='SLSQP', 
-                   options={'maxiter': 1000, 'ftol': 1e-12})
+    # Solve optimization problem with robustness improvements
+    try:
+        res = minimize(objective, x0=initial, constraints=cons, method='SLSQP', 
+                       options={'maxiter': 1000, 'ftol': 1e-12})
+        
+        if not res.success:
+            print(f"Warning: Optimization may not have converged: {res.message}")
+            constraint_violation = np.max(np.abs(constraints(res.x)))
+            print(f"Final constraint violation: {constraint_violation:.2e}")
+            
+            # If constraint violation is too high, try with different initial guess
+            if constraint_violation > 1e-6:
+                print("Retrying with different initial guess...")
+                initial_alt = np.concatenate([np.random.rand(M) * 0.1, np.zeros(n_interior)])
+                res = minimize(objective, x0=initial_alt, constraints=cons, method='SLSQP', 
+                               options={'maxiter': 2000, 'ftol': 1e-12})
+                
+                if not res.success:
+                    print(f"Retry failed: {res.message}")
+                    constraint_violation = np.max(np.abs(constraints(res.x)))
+                    print(f"Final constraint violation after retry: {constraint_violation:.2e}")
     
-    if not res.success:
-        print(f"Warning: Optimization may not have converged: {res.message}")
-        print(f"Final constraint violation: {np.max(np.abs(constraints(res.x)))}")
+    except Exception as e:
+        print(f"Optimization failed with exception: {e}")
+        print("Using linear interpolation fallback")
+        # Return a simple linear function as fallback
+        def linear_fallback(x):
+            return u_xmin + (u_xmax - u_xmin) * (x - xmin) / (xmax - xmin)
+        return linear_fallback
     
     # Extract solution
     u_lssvr = Legendre(res.x[:M], domain_range)
@@ -108,6 +215,10 @@ class FEMLSSVRPrimalSolver:
         self.lssvr_functions = []
         
     def solve_fem(self):
+        """Solve using FEM to get coarse solution."""
+        fem_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         # Create mesh and basis
         m = MeshLine(np.linspace(self.global_domain[0], self.global_domain[1], self.num_fem_nodes))
         element_p = ElementLineP1()
@@ -129,6 +240,11 @@ class FEMLSSVRPrimalSolver:
         A, b = enforce(A, b, D=basis.get_dofs())
         u_fem = solve(A, b)
         
+        fem_time = time.time() - fem_start
+        monitor.fem_time = fem_time
+        monitor.record_operation('FEM_solve', fem_time, f'nodes={self.num_fem_nodes}')
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         # Get node values
         interpolator = basis.interpolator(u_fem)
         self.fem_nodes = m.p[0]
@@ -138,6 +254,9 @@ class FEMLSSVRPrimalSolver:
     
     def solve_lssvr_subproblems(self):
         """Solve LSSVR with primal method in each element."""
+        lssvr_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         self.lssvr_functions = []
         
         for i in range(len(self.fem_nodes) - 1):
@@ -167,43 +286,55 @@ class FEMLSSVRPrimalSolver:
                 def linear_fallback(x):
                     return u_left + (u_right - u_left) * (x - x_start) / (x_end - x_start)
                 self.lssvr_functions.append(linear_fallback)
+        
+        lssvr_time = time.time() - lssvr_start
+        monitor.lssvr_total_time = lssvr_time
+        monitor.record_operation('LSSVR_subproblems', lssvr_time, f'elements={len(self.lssvr_functions)}')
+        monitor.memory_usage.append(monitor.get_memory_usage())
     
     def solve(self):
         """Complete solution: FEM + LSSVR."""
+        solve_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         self.solve_fem()
         self.solve_lssvr_subproblems()
+        
+        solve_time = time.time() - solve_start
+        monitor.total_solve_time = solve_time
+        monitor.record_operation('Total_solve', solve_time, 'FEM + LSSVR')
+        monitor.memory_usage.append(monitor.get_memory_usage())
     
     def evaluate_solution(self, x_points):
         """Evaluate the hybrid solution at given points."""
         solution = np.zeros_like(x_points)
         
-        for i, xi in enumerate(x_points):
-            # Find which element xi belongs to
-            for j in range(len(self.fem_nodes) - 1):
-                if self.fem_nodes[j] <= xi <= self.fem_nodes[j + 1]:
-                    if callable(self.lssvr_functions[j]):
-                        solution[i] = self.lssvr_functions[j](xi)
-                    else:
-                        # Polynomial object
-                        solution[i] = self.lssvr_functions[j](xi)
-                    break
-            else:
-                # Handle boundary cases
-                if xi < self.fem_nodes[0]:
-                    if callable(self.lssvr_functions[0]):
-                        solution[i] = self.lssvr_functions[0](xi)
-                    else:
-                        solution[i] = self.lssvr_functions[0](xi)
-                elif xi > self.fem_nodes[-1]:
-                    if callable(self.lssvr_functions[-1]):
-                        solution[i] = self.lssvr_functions[-1](xi)
-                    else:
-                        solution[i] = self.lssvr_functions[-1](xi)
+        # Find element indices for all points
+        element_indices = np.searchsorted(self.fem_nodes, x_points, side='right') - 1
+        element_indices = np.clip(element_indices, 0, len(self.lssvr_functions) - 1)
+        
+        # Evaluate for each element
+        for j in range(len(self.lssvr_functions)):
+            mask = (element_indices == j)
+            if np.any(mask):
+                if callable(self.lssvr_functions[j]):
+                    solution[mask] = self.lssvr_functions[j](x_points[mask])
+                else:
+                    # Polynomial object
+                    solution[mask] = self.lssvr_functions[j](x_points[mask])
         
         return solution
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Run hybrid FEM-LSSVR solver (Dual version).')
+    parser.add_argument('--no-plot', action='store_true', help='Skip plotting the results.')
+    args = parser.parse_args()
+    
+    # Initialize performance monitoring
+    monitor.reset()
+    
     # Parameters
     num_nodes = 25
     test_points = np.linspace(-1, 1, 201)
@@ -216,14 +347,24 @@ if __name__ == "__main__":
     computed_solution = solver.evaluate_solution(test_points)
     exact_solution = true_solution(test_points)
     
+    # Calculate errors
+    error = np.abs(computed_solution - exact_solution)
+    max_error = np.max(error)
+    l2_error = np.sqrt(np.trapz(error**2, test_points))
+    print(f"Max error: {max_error:.6f}")
+    print(f"L2 error: {l2_error:.6f}")
     
-    # plot of solution
-    plt.figure(figsize=(10, 6))
-    plt.plot(test_points, exact_solution, 'r-', label='Exact Solution', linewidth=2)
-    plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Primal Solution', linewidth=2)
-    plt.scatter(solver.fem_nodes, solver.fem_values, c='green', s=50, label='FEM Nodes', zorder=5)
-    plt.xlabel('x')
-    plt.ylabel('u(x)')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # Print performance summary
+    monitor.print_summary()
+    
+    if not args.no_plot:
+        # plot of solution
+        plt.figure(figsize=(10, 6))
+        plt.plot(test_points, exact_solution, 'r-', label='Exact Solution', linewidth=2)
+        plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Dual Solution', linewidth=2)
+        plt.scatter(solver.fem_nodes, solver.fem_values, c='green', s=50, label='FEM Nodes', zorder=5)
+        plt.xlabel('x')
+        plt.ylabel('u(x)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
