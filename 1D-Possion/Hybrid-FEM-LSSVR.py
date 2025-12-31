@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from numpy.polynomial.legendre import Legendre, leggauss
 from skfem import *
 from skfem.helpers import dot, grad
+import argparse
 
 def true_solution(x):
     return np.sin(np.pi * x)
@@ -59,7 +60,7 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
         u = Legendre(w, domain_range)
         
         # PDE constraints with slack variables
-        pde_constraints = [residual(u, x) + e[i] for i, x in enumerate(training_points)]
+        pde_constraints = residual(u, training_points) + e
         
         # Boundary constraints
         bc_constraints = []
@@ -78,7 +79,7 @@ def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
             bc_right = u(xmax) - u_xmax
         bc_constraints.append(bc_right)
         
-        return np.array(pde_constraints + bc_constraints)
+        return np.concatenate([pde_constraints, bc_constraints])
     
     # Initial guess
     initial = np.concatenate([np.random.rand(M) * 0.01, np.zeros(n_interior)])
@@ -185,33 +186,24 @@ class FEMLSSVRPrimalSolver:
         """Evaluate the hybrid solution at given points."""
         solution = np.zeros_like(x_points)
         
-        for i, xi in enumerate(x_points):
-            # Find which element xi belongs to
-            for j in range(len(self.fem_nodes) - 1):
-                if self.fem_nodes[j] <= xi <= self.fem_nodes[j + 1]:
-                    if callable(self.lssvr_functions[j]):
-                        solution[i] = self.lssvr_functions[j](xi)
-                    else:
-                        # Polynomial object
-                        solution[i] = self.lssvr_functions[j](xi)
-                    break
-            else:
-                # Handle boundary cases
-                if xi < self.fem_nodes[0]:
-                    if callable(self.lssvr_functions[0]):
-                        solution[i] = self.lssvr_functions[0](xi)
-                    else:
-                        solution[i] = self.lssvr_functions[0](xi)
-                elif xi > self.fem_nodes[-1]:
-                    if callable(self.lssvr_functions[-1]):
-                        solution[i] = self.lssvr_functions[-1](xi)
-                    else:
-                        solution[i] = self.lssvr_functions[-1](xi)
+        # Find element indices for all points
+        element_indices = np.searchsorted(self.fem_nodes, x_points, side='right') - 1
+        element_indices = np.clip(element_indices, 0, len(self.lssvr_functions) - 1)
+        
+        # Evaluate for each element
+        for j in range(len(self.lssvr_functions)):
+            mask = (element_indices == j)
+            if np.any(mask):
+                solution[mask] = self.lssvr_functions[j](x_points[mask])
         
         return solution
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Run hybrid FEM-LSSVR solver.')
+    parser.add_argument('--no-plot', action='store_true', help='Skip plotting the results.')
+    args = parser.parse_args()
+    
     # Parameters
     num_nodes = 25
     test_points = np.linspace(-1, 1, 201)
@@ -224,14 +216,14 @@ if __name__ == "__main__":
     computed_solution = solver.evaluate_solution(test_points)
     exact_solution = true_solution(test_points)
     
-    
-    # plot of solution
-    plt.figure(figsize=(10, 6))
-    plt.plot(test_points, exact_solution, 'r-', label='Exact Solution', linewidth=2)
-    plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Solution', linewidth=2)
-    plt.scatter(solver.fem_nodes, solver.fem_values, c='green', s=50, label='FEM Nodes', zorder=5)
-    plt.xlabel('x')
-    plt.ylabel('u(x)')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    if not args.no_plot:
+        # plot of solution
+        plt.figure(figsize=(10, 6))
+        plt.plot(test_points, exact_solution, 'r-', label='Exact Solution', linewidth=2)
+        plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Solution', linewidth=2)
+        plt.scatter(solver.fem_nodes, solver.fem_values, c='green', s=50, label='FEM Nodes', zorder=5)
+        plt.xlabel('x')
+        plt.ylabel('u(x)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
