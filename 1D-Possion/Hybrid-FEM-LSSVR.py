@@ -22,6 +22,35 @@ except ImportError:
     USE_CYTHON = False
     print("Cython extension not available, using optimized Python version")
 
+# Try to import advanced Cython optimizations
+try:
+    import sys
+    import os
+    # Add cython build directory to path (relative to this script)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cython_build_dir = os.path.join(script_dir, 'cython', 'build', 'lib.macosx-10.9-universal2-cpython-310')
+    if cython_build_dir not in sys.path:
+        sys.path.insert(0, cython_build_dir)
+
+    from lssvr_optimized import (
+        iterative_refinement_cython,
+        preconditioned_cg_cython,
+        batch_lssvr_solve_cython,
+        assemble_kkt_dense_cython,
+        scale_kkt_system_cython,
+        build_legendre_second_derivatives_cython,
+        build_legendre_boundary_values_cython,
+        generate_gauss_lobatto_points_cython,
+        compute_slack_variables_cython,
+        check_boundary_constraints_cython,
+        compute_constraint_violation_cython
+    )
+    USE_ADVANCED_CYTHON = True
+    print("Advanced Cython optimizations available and enabled")
+except ImportError as e:
+    USE_ADVANCED_CYTHON = False
+    print(f"Advanced Cython optimizations not available ({e}), using standard implementations")
+
 # Enable vectorized matrix building for maximum performance
 USE_VECTORIZED = False  # Temporarily disabled - needs more optimization
 
@@ -411,7 +440,18 @@ def preconditioned_conjugate_gradient(A, b, max_iter=500, tol=1e-8):
         P[:M, :M] = np.eye(M)  # Identity for main block (H is already preconditioned)
         P[M:M+2, M:M+2] = S_inv
 
-        # Preconditioned CG
+        # Use Cython-optimized CG if available
+        if USE_ADVANCED_CYTHON:
+            try:
+                # Extract diagonal of preconditioner for Cython version
+                M_diag = np.diag(P)
+                M_diag[M_diag == 0] = 1.0  # Avoid division by zero
+                x, iterations = preconditioned_cg_cython(A, b, M_diag, max_iter, tol)
+                return x, f"cython_cg_converged_iter_{iterations}"
+            except Exception as e:
+                print(f"Cython CG failed: {e}, using Python fallback")
+
+        # Preconditioned CG (Python fallback)
         x = np.zeros(n)
         r = b - A @ x
         z = P @ r
@@ -440,11 +480,19 @@ def preconditioned_conjugate_gradient(A, b, max_iter=500, tol=1e-8):
         # Fallback to simple diagonal preconditioner
         diag_A = np.diag(A)
         diag_A[diag_A == 0] = 1.0
-        P_diag = 1.0 / diag_A
+        M_diag = 1.0 / diag_A
 
+        if USE_ADVANCED_CYTHON:
+            try:
+                x, iterations = preconditioned_cg_cython(A, b, M_diag, max_iter, tol)
+                return x, f"cython_diag_converged_iter_{iterations}"
+            except Exception as e:
+                print(f"Cython diagonal CG failed: {e}, using Python fallback")
+
+        # Python fallback diagonal CG
         x = np.zeros(n)
         r = b - A @ x
-        z = P_diag * r
+        z = M_diag * r
         p = z.copy()
         rz_old = r @ z
 
@@ -472,9 +520,15 @@ def iterative_refinement(A, b, x0, max_iter=3, tol=1e-12):
     """
     Iterative refinement to improve solution accuracy for well-conditioned systems.
 
-    Solves A * x = b using the initial guess x0 and iteratively corrects
-    the solution based on the residual r = b - A*x.
+    Uses Cython-optimized version when available, falls back to Python implementation.
     """
+    if USE_ADVANCED_CYTHON:
+        try:
+            return iterative_refinement_cython(A, b, x0, max_iter, tol)
+        except Exception as e:
+            print(f"Cython iterative refinement failed: {e}, using Python fallback")
+
+    # Python fallback implementation
     x = x0.copy()
     n = len(b)
 
@@ -500,36 +554,26 @@ def iterative_refinement(A, b, x0, max_iter=3, tol=1e-12):
 def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
     """
     Dense KKT solver with optimized block algorithms (original implementation).
+    Now uses Cython optimizations where available.
     """
-    # Pre-compute common matrices to avoid redundant calculations
-    ATA = A.T @ A  # This is used in multiple places
-    ATb = A.T @ b_pde
-
-    # Build KKT system more efficiently
-    main_block = np.eye(M) + gamma * ATA
-
-    # Build full KKT matrix
-    kkt_matrix = np.zeros((M + 2, M + 2))
-    kkt_matrix[:M, :M] = main_block
-    kkt_matrix[:M, M:M+2] = C.T
-    kkt_matrix[M:M+2, :M] = C
-
-    kkt_rhs = np.zeros(M + 2)
-    kkt_rhs[:M] = gamma * ATb
-    kkt_rhs[M:M+2] = b_bc
-
-    # Optimized matrix scaling using vectorized operations
-    row_norms = np.sqrt(np.sum(kkt_matrix**2, axis=1))
-    row_norms[row_norms == 0] = 1.0  # Avoid division by zero
-
-    # Scale matrix and RHS in-place for better memory efficiency
-    kkt_matrix_scaled = kkt_matrix / row_norms[:, np.newaxis]
-    kkt_rhs_scaled = kkt_rhs / row_norms
-
-    # Compute condition number only once
-    cond_num = np.linalg.cond(kkt_matrix_scaled)
-
-    # Try direct solver first (most common case)
+    if USE_CYTHON and M <= 8:  # Use Cython only for low M values where it's numerically stable
+        try:
+            # Use Cython-optimized KKT assembly
+            kkt_matrix, kkt_rhs = assemble_kkt_dense_cython(A, C, b_pde, b_bc, gamma)
+            kkt_matrix_scaled, kkt_rhs_scaled, row_norms = scale_kkt_system_cython(kkt_matrix, kkt_rhs)
+            cond_num = np.linalg.cond(kkt_matrix_scaled)
+            
+            # Use Cython-optimized solver path
+            return solve_lssvr_system_dense_cython_scaled(kkt_matrix_scaled, kkt_rhs_scaled, 
+                                                        kkt_matrix, kkt_rhs, row_norms, 
+                                                        cond_num, A, C, M, gamma)
+        except Exception as e:
+            print(f"Cython KKT assembly failed: {e}, using Python fallback")
+            # Fall back to Python implementation
+            return solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma)
+    else:
+        # Use Python implementation for high M values or when Cython disabled
+        return solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma)    # Try direct solver first (most common case)
     if cond_num < 1e10:
         try:
             solution_scaled = solve(kkt_matrix_scaled, kkt_rhs_scaled)
@@ -595,6 +639,221 @@ def solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma):
             r2 = r[M:M+2]
             y1 = solve(H, r1)
             y2 = S_inv @ (r2 - C @ y1)
+            return np.concatenate([y1, y2])
+
+        solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled,
+                                    M=block_preconditioner, rtol=1e-10, maxiter=1000)
+
+        if info == 0:
+            return solution_scaled, "iterative_block_preconditioned"
+        else:
+            print(f"GMRES failed to converge: info={info}")
+
+    except Exception as e:
+        print(f"Iterative solver failed: {e}")
+
+    # Ultimate fallback: least squares solution
+    try:
+        solution_ls = np.linalg.lstsq(kkt_matrix_scaled, kkt_rhs_scaled, rcond=None)[0]
+        return solution_ls, "least_squares_fallback"
+    except:
+        raise RuntimeError("All LSSVR solvers failed - this should not happen")
+
+def solve_lssvr_system_dense_cython_scaled(kkt_matrix_scaled, kkt_rhs_scaled, 
+                                          kkt_matrix, kkt_rhs, row_norms,
+                                          cond_num, A, C, M, gamma):
+    """
+    Cython-optimized solver path using pre-computed scaled KKT system.
+    """
+    # Try direct solver first (most common case)
+    if cond_num < 1e10:
+        try:
+            solution_scaled = solve(kkt_matrix_scaled, kkt_rhs_scaled)
+
+            # Iterative refinement for well-conditioned systems
+            if cond_num < 1e6:
+                solution_scaled = iterative_refinement(kkt_matrix_scaled, kkt_rhs_scaled,
+                                                     solution_scaled, max_iter=3, tol=1e-12)
+
+            return solution_scaled, "cython_direct_scaled_refined"
+        except np.linalg.LinAlgError:
+            pass  # Fall through to other methods
+
+    # For moderately ill-conditioned systems, try optimized block preconditioning
+    if cond_num < 1e12:
+        try:
+            # Reconstruct main_block from kkt_matrix (it's the top-left M x M block)
+            main_block = kkt_matrix[:M, :M]
+            
+            H = main_block
+            H_inv_CT = solve(H, C.T)
+            S = -C @ H_inv_CT
+            S_inv = np.linalg.inv(S)
+
+            P = np.zeros((M + 2, M + 2))
+            P[:M, :M] = np.eye(M)
+            P[M:M+2, M:M+2] = S_inv
+            P[M:M+2, :M] = -S_inv @ C @ solve(H, np.eye(M))
+
+            # Apply preconditioner
+            P_scaled = P / row_norms[:, np.newaxis]
+            kkt_preconditioned = P_scaled @ kkt_matrix_scaled
+            rhs_preconditioned = P_scaled @ kkt_rhs_scaled
+
+            solution_scaled = solve(kkt_preconditioned, rhs_preconditioned)
+            return solution_scaled, "cython_block_preconditioned"
+        except Exception as e:
+            print(f"Cython block preconditioning failed: {e}")
+
+    # For very large or ill-conditioned systems, try preconditioned conjugate gradients
+    if M > 15 or cond_num > 1e10:
+        try:
+            solution_scaled, method = preconditioned_conjugate_gradient(
+                kkt_matrix_scaled, kkt_rhs_scaled, max_iter=min(500, M*5), tol=1e-8
+            )
+            return solution_scaled, f"cython_pcg_{method}"
+        except Exception as e:
+            print(f"Cython PCG failed: {e}")
+
+    # Final fallback: iterative solver with block preconditioning
+    try:
+        from scipy.sparse.linalg import gmres
+
+        # Reconstruct main_block
+        main_block = kkt_matrix[:M, :M]
+        
+        H = main_block
+        H_inv_CT = solve(H, C.T)
+        S = -C @ H_inv_CT
+        S_inv = np.linalg.inv(S)
+
+        def block_preconditioner(r):
+            r1 = r[:M]
+            r2 = r[M:M+2]
+            y1 = solve(H, r1)
+            y2 = S_inv @ (r2 - C @ y1)
+            return np.concatenate([y1, y2])
+
+        solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled,
+                                    M=block_preconditioner, rtol=1e-10, maxiter=1000)
+
+        if info == 0:
+            return solution_scaled, "cython_iterative_block_preconditioned"
+        else:
+            print(f"Cython GMRES failed to converge: info={info}")
+
+    except Exception as e:
+        print(f"Cython iterative solver failed: {e}")
+
+    # Ultimate fallback: least squares solution
+    try:
+        solution_ls = np.linalg.lstsq(kkt_matrix_scaled, kkt_rhs_scaled, rcond=None)[0]
+        return solution_ls, "cython_least_squares_fallback"
+    except:
+        raise RuntimeError("All Cython LSSVR solvers failed - this should not happen")
+
+def solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma):
+    """
+    Original Python implementation of dense LSSVR solver (fallback).
+    """
+    # Pre-compute common matrices to avoid redundant calculations
+    ATA = A.T @ A  # This is used in multiple places
+    ATb = A.T @ b_pde
+
+    # Build KKT system more efficiently
+    main_block = np.eye(M) + gamma * ATA
+
+    # Build full KKT matrix
+    kkt_matrix = np.zeros((M + 2, M + 2))
+    kkt_matrix[:M, :M] = main_block
+    kkt_matrix[:M, M:M+2] = C.T
+    kkt_matrix[M:M+2, :M] = C
+
+    kkt_rhs = np.zeros(M + 2)
+    kkt_rhs[:M] = gamma * ATb
+    kkt_rhs[M:M+2] = b_bc
+
+    # Optimized matrix scaling using vectorized operations
+    row_norms = np.sqrt(np.sum(kkt_matrix**2, axis=1))
+    row_norms[row_norms == 0] = 1.0  # Avoid division by zero
+
+    # Scale matrix and RHS in-place for better memory efficiency
+    kkt_matrix_scaled = kkt_matrix / row_norms[:, np.newaxis]
+    kkt_rhs_scaled = kkt_rhs / row_norms
+
+    # Compute condition number only once
+    cond_num = np.linalg.cond(kkt_matrix_scaled)
+
+    # Try direct solver first (most common case)
+    if cond_num < 1e10:
+        try:
+            solution_scaled = solve(kkt_matrix_scaled, kkt_rhs_scaled)
+
+            # Iterative refinement for well-conditioned systems
+            if cond_num < 1e6:
+                solution_scaled = iterative_refinement(kkt_matrix_scaled, kkt_rhs_scaled,
+                                                     solution_scaled, max_iter=3, tol=1e-12)
+
+            return solution_scaled, "direct_scaled_refined"
+        except np.linalg.LinAlgError:
+            pass  # Fall through to other methods
+
+    # For moderately ill-conditioned systems, try optimized block preconditioning
+    if cond_num < 1e12:
+        try:
+            H = kkt_matrix_scaled[:M, :M]
+            C_block = kkt_matrix_scaled[M:M+2, :M]
+
+            H_inv_CT = solve(H, kkt_matrix_scaled[:M, M:M+2])
+            S = -C_block @ H_inv_CT
+            S_inv = np.linalg.inv(S)
+
+            P = np.zeros((M + 2, M + 2))
+            P[:M, :M] = np.eye(M)
+            P[M:M+2, M:M+2] = S_inv
+
+            kkt_matrix_precond = P @ kkt_matrix_scaled
+            kkt_rhs_precond = P @ kkt_rhs_scaled
+
+            solution_precond = solve(kkt_matrix_precond, kkt_rhs_precond)
+            solution_scaled = P @ solution_precond
+
+            # Iterative refinement for block preconditioned solution
+            if cond_num < 1e8:
+                solution_scaled = iterative_refinement(kkt_matrix_scaled, kkt_rhs_scaled,
+                                                     solution_scaled, max_iter=2, tol=1e-10)
+
+            return solution_scaled, "block_preconditioned_refined"
+
+        except np.linalg.LinAlgError:
+            pass
+
+    # For very large or ill-conditioned systems, try preconditioned conjugate gradients
+    if M > 15 or cond_num > 1e10:
+        try:
+            solution_scaled, method = preconditioned_conjugate_gradient(
+                kkt_matrix_scaled, kkt_rhs_scaled, max_iter=min(500, M*5), tol=1e-8
+            )
+            return solution_scaled, f"pcg_{method}"
+        except Exception as e:
+            print(f"PCG failed: {e}")
+
+    # Final fallback: iterative solver with block preconditioning
+    try:
+        from scipy.sparse.linalg import gmres
+
+        H = kkt_matrix_scaled[:M, :M]
+        C_block = kkt_matrix_scaled[M:M+2, :M]
+
+        H_inv_CT = solve(H, kkt_matrix_scaled[:M, M:M+2])
+        S = -C_block @ H_inv_CT
+        S_inv = np.linalg.inv(S)
+
+        def block_preconditioner(r):
+            r1 = r[:M]
+            r2 = r[M:M+2]
+            y1 = solve(H, r1)
+            y2 = S_inv @ (r2 - C_block @ y1)
             return np.concatenate([y1, y2])
 
         solution_scaled, info = gmres(kkt_matrix_scaled, kkt_rhs_scaled,
@@ -899,6 +1158,16 @@ class FEMLSSVRPrimalSolver:
         self.fem_nodes = m.p[0]
         self.fem_values = interpolator(self.fem_nodes.reshape(1, -1)).flatten()
         
+        # Compute FEM error for reference
+        test_points_fem = np.linspace(self.global_domain[0], self.global_domain[1], 201)
+        fem_solution_at_test = interpolator(test_points_fem.reshape(1, -1)).flatten()
+        exact_at_test = true_solution(test_points_fem)
+        fem_error = np.abs(fem_solution_at_test - exact_at_test)
+        fem_max_error = np.max(fem_error)
+        fem_l2_error = np.sqrt(integrate.trapezoid(fem_error**2, test_points_fem))
+        print(f"FEM Max error: {fem_max_error:.6e}")
+        print(f"FEM L2 error: {fem_l2_error:.6e}")
+        
         return u_fem, basis
     
     def solve_lssvr_subproblems(self):
@@ -1020,13 +1289,14 @@ class FEMLSSVRPrimalSolver:
         
         # SIMD-optimized batch processing: vectorize training points and RHS computation
         # Generate training points for all elements in batch simultaneously
-        training_points_batch = np.zeros((batch_size, 8))  # 8 Gauss-Lobatto points per element
+        n_training_per_element = max(8, self.lssvr_M + 5)  # Use at least M+5 training points
+        training_points_batch = np.zeros((batch_size, n_training_per_element))
         for i in range(batch_size):
-            points = gauss_lobatto_points(8, domain=(x_starts[i], x_ends[i]))
+            points = gauss_lobatto_points(n_training_per_element, domain=(x_starts[i], x_ends[i]))
             training_points_batch[i, :] = points
         
         # Vectorized RHS computation across all elements
-        f_vals_batch = np.zeros((batch_size, 8))
+        f_vals_batch = np.zeros((batch_size, n_training_per_element))
         for i in range(batch_size):
             f_vals_batch[i, :] = poisson_rhs(training_points_batch[i, :])
         
@@ -1049,14 +1319,14 @@ class FEMLSSVRPrimalSolver:
         for i in range(batch_size):
             domain_range = [x_starts[i], x_ends[i]]
             
-            # Build constraint matrices using vectorized operations
-            if USE_VECTORIZED:
-                A, C = build_legendre_matrices_vectorized(
+            # Build constraint matrices using optimized operations
+            if USE_CYTHON and self.lssvr_M <= 8:
+                A, C = build_legendre_matrices_cython(
                     self.lssvr_M, training_points_batch[i, :], 
                     x_starts[i], x_ends[i], domain_range
                 )
-            elif USE_CYTHON:
-                A, C = build_legendre_matrices_cython(
+            elif USE_VECTORIZED:
+                A, C = build_legendre_matrices_vectorized(
                     self.lssvr_M, training_points_batch[i, :], 
                     x_starts[i], x_ends[i], domain_range
                 )

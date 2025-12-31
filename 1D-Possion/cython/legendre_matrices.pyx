@@ -1,6 +1,6 @@
 import numpy as np
 cimport numpy as cnp
-from libc.math cimport pow
+from libc.math cimport pow, sqrt
 
 cdef extern from "numpy/arrayobject.h":
     void PyArray_ENABLEFLAGS(cnp.ndarray arr, int flags)
@@ -26,33 +26,71 @@ cdef double legendre_p(int n, double x):
             p_prev1 = p_current
         return p_prev1
 
-cdef double legendre_p_deriv2(int n, double x):
-    """Evaluate second derivative of Legendre polynomial P_n''(x) on [-1,1]."""
-    cdef double x2, x3, x4, x5
+cdef double legendre_p_deriv2_robust(int n, double x):
+    """
+    Compute P_n''(x) using robust recurrence relations with numerical safeguards.
+    Uses the three-term recurrence for derivatives directly, with overflow protection.
+    """
+    cdef double p0 = 1.0      # P_0(x)
+    cdef double p1 = x        # P_1(x)
+    cdef double d0 = 0.0      # P_0'(x)
+    cdef double d1 = 1.0      # P_1'(x)
+    cdef double dd0 = 0.0     # P_0''(x)
+    cdef double dd1 = 0.0     # P_1''(x)
     
-    if n == 0 or n == 1:
+    cdef double pn, dn, ddn
+    cdef int k
+    cdef double max_val = 1e100  # Overflow threshold
+    
+    if n == 0:
+        return 0.0
+    elif n == 1:
         return 0.0
     elif n == 2:
         return 3.0
-    elif n == 3:
-        return 15.0 * x
-    elif n == 4:
-        x2 = x*x
-        return 52.5 * x2 - 7.5
-    elif n == 5:
-        x3 = x*x*x
-        return 157.5 * x3 - 52.5 * x
-    elif n == 6:
-        x2 = x*x
-        x4 = x2*x2
-        return 433.125 * x4 - 236.25 * x2 + 13.125
-    elif n == 7:
-        x2 = x*x
-        x3 = x2*x
-        x5 = x3*x2
-        return 1126.125 * x5 - 866.25 * x3 + 118.125 * x
     else:
-        return 0.0
+        # Use stable recurrence relations for all n > 2
+        for k in range(2, n+1):
+            # Three-term recurrence for Legendre polynomials:
+            # P_k(x) = ((2k-1)*x*P_{k-1}(x) - (k-1)*P_{k-2}(x)) / k
+            
+            pn = ((2.0*k-1.0)*x*p1 - (k-1.0)*p0) / k
+            
+            # Check for overflow and rescale if needed
+            if abs(pn) > max_val:
+                # Rescale all values to prevent overflow
+                p0 /= max_val
+                p1 /= max_val
+                d0 /= max_val
+                d1 /= max_val
+                dd0 /= max_val
+                dd1 /= max_val
+                pn /= max_val
+            
+            # Derivative recurrence:
+            # P_k'(x) = ((2k-1)*(P_{k-1}(x) + x*P_{k-1}'(x)) - (k-1)*P_{k-2}'(x)) / k
+            
+            dn = ((2.0*k-1.0)*(p1 + x*d1) - (k-1.0)*d0) / k
+            
+            # Second derivative recurrence:
+            # P_k''(x) = ((2k-1)*(2*P_{k-1}'(x) + x*P_{k-1}''(x)) - (k-1)*P_{k-2}''(x)) / k
+            
+            ddn = ((2.0*k-1.0)*(2.0*d1 + x*dd1) - (k-1.0)*dd0) / k
+            
+            # Update for next iteration
+            p0 = p1
+            p1 = pn
+            d0 = d1
+            d1 = dn
+            dd0 = dd1
+            dd1 = ddn
+        
+        return dd1
+
+cdef double legendre_p_deriv2(int n, double x):
+    """Evaluate second derivative of Legendre polynomial P_n''(x) on [-1,1]."""
+    # Use robust recurrence relations for all n to ensure numerical stability
+    return legendre_p_deriv2_robust(n, x)
 
 cdef double legendre_p_deriv2_domain(int n, double x, double a, double b):
     """Evaluate second derivative of Legendre polynomial P_n''(x) on domain [a,b]."""
