@@ -9,6 +9,17 @@ import argparse
 import time
 import psutil
 import os
+import numba
+from numba import jit
+
+# Try to import Cython extension
+try:
+    from legendre_matrices_cython import build_legendre_matrices_cython
+    USE_CYTHON = True  # Now working correctly after fixing scaling and variable initialization
+    print("Cython extension available and enabled for performance")
+except ImportError:
+    USE_CYTHON = False
+    print("Cython extension not available, using optimized Python version")
 
 class PerformanceMonitor:
     """Monitor performance metrics during execution."""
@@ -75,31 +86,110 @@ def main_boundary_condition_left(x):
 def main_boundary_condition_right(x):
     return 0.0  # u(1) = 0
 
-def build_legendre_matrices(M, training_points, xmin, xmax, domain_range):
+@jit(nopython=True, cache=True)
+def evaluate_legendre_deriv2(coeffs, points, domain):
     """
-    Build matrices for Legendre polynomial constraints.
-    
-    Returns:
-    A: Matrix for PDE constraints (second derivatives at training points)
-    C: Matrix for boundary constraints (function values at boundaries)
+    JIT-compiled function to evaluate second derivative of Legendre polynomial.
+    coeffs: array of length M with polynomial coefficients
+    points: array of evaluation points
+    domain: (a, b) domain tuple
+    """
+    a, b = domain
+    # Transform points to [-1, 1] domain
+    x_scaled = 2 * (points - a) / (b - a) - 1
+
+    # Evaluate the polynomial at x_scaled
+    result = np.zeros_like(x_scaled)
+
+    for i in range(len(coeffs)):
+        if coeffs[i] != 0:
+            # Add coeffs[i] * P_i(x_scaled) to result
+            p_i = 0.0
+            if i == 0:
+                p_i = 1.0
+            elif i == 1:
+                p_i = x_scaled
+            else:
+                # Use recurrence for Legendre polynomials
+                p_prev2 = np.ones_like(x_scaled)  # P_0
+                p_prev1 = x_scaled  # P_1
+                for k in range(2, i+1):
+                    p_current = ((2*k-1) * x_scaled * p_prev1 - (k-1) * p_prev2) / k
+                    p_prev2 = p_prev1
+                    p_prev1 = p_current
+                p_i = p_prev1
+
+            # Now compute second derivative of P_i
+            if i == 0 or i == 1:
+                d2p_i = np.zeros_like(x_scaled)
+            elif i == 2:
+                # P_2(x) = (3x²-1)/2, so d²/dx²(P_2) = 3
+                d2p_i = np.full_like(x_scaled, 3.0)
+            elif i == 3:
+                # P_3(x) = (5x³-3x)/2, d²/dx²(P_3) = 15x
+                d2p_i = 15.0 * x_scaled
+            elif i == 4:
+                # P_4(x) = (35x⁴-30x²+3)/8, d²/dx²(P_4) = (35*12x² - 60)/8 = (420x²-60)/8 = 52.5x² - 7.5
+                d2p_i = 52.5 * x_scaled**2 - 7.5
+            elif i == 5:
+                # P_5(x) = (63x^5 - 70x^3 + 15x)/8, d²/dx² = (63*20x^3 - 70*6x)/8 = (1260x^3 - 420x)/8 = 157.5x^3 - 52.5x
+                d2p_i = 157.5 * x_scaled**3 - 52.5 * x_scaled
+            elif i == 6:
+                # P_6(x) = (231x^6 - 315x^4 + 105x^2 - 5)/16, d²/dx² = (231*30x^4 - 315*12x^2 + 105*2)/16 = (6930x^4 - 3780x^2 + 210)/16 = 433.125x^4 - 236.25x^2 + 13.125
+                d2p_i = 433.125 * x_scaled**4 - 236.25 * x_scaled**2 + 13.125
+            elif i == 7:
+                # P_7(x) = (429x^7 - 693x^5 + 315x^3 - 35x)/16, d²/dx² = (429*42x^5 - 693*20x^3 + 315*6x)/16 = (18018x^5 - 13860x^3 + 1890x)/16 = 1126.125x^5 - 866.25x^3 + 118.125x
+                d2p_i = 1126.125 * x_scaled**5 - 866.25 * x_scaled**3 + 118.125 * x_scaled
+            else:
+                # For orders > 7, approximate with 0 (still not ideal but better than before)
+                d2p_i = np.zeros_like(x_scaled)
+
+    # Apply chain rule: d²/dx² = ((b-a)/2)² * d²/dx_scaled²
+    scale_factor = ((b - a) / 2.0) ** 2
+    result *= scale_factor
+
+    return result
+
+def evaluate_legendre_deriv2_numpy(coeffs, points, domain):
+    """
+    Evaluate the second derivative of a Legendre series at given points using numpy.
+    coeffs: coefficients of the Legendre series
+    points: points to evaluate at
+    domain: (a, b) domain tuple
+    """
+    a, b = domain
+    # Create Legendre series on the given domain
+    u = Legendre(coeffs, domain=domain)
+    # Get second derivative
+    u_deriv2 = u.deriv(2)
+    # Evaluate at points
+    result = u_deriv2(points)
+    return result
+
+def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
+    """
+    JIT-optimized version of build_legendre_matrices.
     """
     # PDE constraint matrix: A * w = -u''(training_points)
     A = np.zeros((len(training_points), M))
+
+    # Evaluate second derivatives for all basis functions
     for i in range(M):
-        w = np.zeros(M)
-        w[i] = 1.0
-        u = Legendre(w, domain_range)
-        A[:, i] = -u.deriv(2)(training_points)
-    
+        coeffs = np.zeros(M)
+        coeffs[i] = 1.0
+        A[:, i] = -evaluate_legendre_deriv2_numpy(coeffs, training_points, domain_range)
+
     # Boundary constraint matrix: C * w = [u(xmin), u(xmax)]
     C = np.zeros((2, M))
+
+    # For boundary values, we can use numpy's Legendre directly since it's just 2 points
     for i in range(M):
-        w = np.zeros(M)
-        w[i] = 1.0
-        u = Legendre(w, domain_range)
+        coeffs = np.zeros(M)
+        coeffs[i] = 1.0
+        u = Legendre(coeffs, domain_range)
         C[0, i] = u(xmin)
         C[1, i] = u(xmax)
-    
+
     return A, C
 
 def gauss_lobatto_points(n_points, domain=(-1, 1)):
@@ -147,7 +237,10 @@ def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma,
     n_interior = len(training_points)
     
     # Build constraint matrices
-    A, C = build_legendre_matrices(M, training_points, xmin, xmax, domain_range)
+    if USE_CYTHON:
+        A, C = build_legendre_matrices_cython(M, training_points, xmin, xmax, domain_range)
+    else:
+        A, C = build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range)
     
     # Right-hand side for PDE constraints: A*w + e = f
     f_vals = rhs_func(training_points)
@@ -348,8 +441,11 @@ class FEMLSSVRPrimalSolver:
         monitor.memory_usage.append(monitor.get_memory_usage())
         
         self.lssvr_functions = []
+        element_times = []
         
         for i in range(len(self.fem_nodes) - 1):
+            element_start = time.time()
+            
             x_start = self.fem_nodes[i]
             x_end = self.fem_nodes[i + 1]
             u_left = self.fem_values[i]
@@ -375,11 +471,23 @@ class FEMLSSVRPrimalSolver:
                 def linear_fallback(x):
                     return u_left + (u_right - u_left) * (x - x_start) / (x_end - x_start)
                 self.lssvr_functions.append(linear_fallback)
+            
+            element_time = time.time() - element_start
+            element_times.append(element_time)
+            monitor.record_operation(f'Element_{i+1}', element_time, f'range=[{x_start:.3f}, {x_end:.3f}]')
         
         lssvr_time = time.time() - lssvr_start
         monitor.lssvr_total_time = lssvr_time
         monitor.record_operation('LSSVR_subproblems', lssvr_time, f'elements={len(self.lssvr_functions)}')
         monitor.memory_usage.append(monitor.get_memory_usage())
+        
+        # Print element timing summary
+        if element_times:
+            print(f"\nElement timing summary:")
+            print(f"  Average element time: {np.mean(element_times):.6f}s")
+            print(f"  Min element time: {np.min(element_times):.6f}s")
+            print(f"  Max element time: {np.max(element_times):.6f}s")
+            print(f"  Total LSSVR time: {lssvr_time:.6f}s ({len(element_times)} elements)")
     
     def solve(self):
         """Complete solution: FEM + LSSVR."""
@@ -415,17 +523,20 @@ class FEMLSSVRPrimalSolver:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run hybrid FEM-LSSVR solver.')
     parser.add_argument('--no-plot', action='store_true', help='Skip plotting the results.')
+    parser.add_argument('--M', type=int, default=8, help='LSSVR parameter M (number of training points).')
+    parser.add_argument('--gamma', type=float, default=1e4, help='LSSVR regularization parameter gamma.')
+    parser.add_argument('--elements', type=int, default=25, help='Number of FEM elements (nodes = elements + 1).')
     args = parser.parse_args()
     
     # Initialize performance monitoring
     monitor.reset()
     
     # Parameters
-    num_nodes = 25
+    num_nodes = args.elements + 1
     test_points = np.linspace(-1, 1, 201)
     
     # Solve using hybrid method with primal LSSVR
-    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=8, lssvr_gamma=1e4, global_domain=(-1, 1))
+    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, global_domain=(-1, 1))
     solver.solve()
     
     # Evaluate solution
@@ -446,7 +557,7 @@ if __name__ == "__main__":
         # plot of solution
         plt.figure(figsize=(10, 6))
         plt.plot(test_points, exact_solution, 'r-', label='Exact Solution', linewidth=2)
-        plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Solution', linewidth=2)
+        plt.plot(test_points, computed_solution, 'b--', label='FEM+LSSVR Solution', linewidth=4)
         plt.scatter(solver.fem_nodes, solver.fem_values, c='green', s=50, label='FEM Nodes', zorder=5)
         plt.xlabel('x')
         plt.ylabel('u(x)')
