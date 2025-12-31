@@ -15,10 +15,11 @@ This document summarizes the performance profiling and optimizations applied to 
 - **After**: Used `np.searchsorted` to efficiently determine element indices for all points at once, then vectorized evaluation per element using boolean masking.
 - **Impact**: Significantly reduces the O(N * M) complexity (where N is evaluation points, M is elements) to more efficient vectorized operations.
 
-### 3. Optimization of Training Points in LSSVR
-- **Before**: Used 12 linearly spaced training points per element for PDE constraints.
-- **After**: Reduced to 8 training points per element, maintaining accuracy while reducing computational cost.
-- **Impact**: Further reduces the size of the optimization problem (fewer variables and constraints), leading to faster convergence of the LSSVR solver.
+### 4. Direct Linear Algebra Solver for LSSVR
+- **Before**: Used `scipy.optimize.minimize` with SLSQP for constrained quadratic optimization
+- **After**: Direct solution of the KKT system using `scipy.linalg.solve`
+- **Impact**: Eliminates iterative optimization, providing exact solution in one linear algebra operation
+- **Implementation**: Built constraint matrices for PDE (second derivatives) and boundary conditions, solved the saddle-point system directly
 
 ## Performance Comparison
 
@@ -31,14 +32,20 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Accuracy**: Max error: 0.000003, L2 error: 0.000003 (maintained)
 - **Improvement**: ~27% reduction in execution time (from 0.764s to 0.560s) with no loss in accuracy
 
+### Version 3: Direct Linear Algebra Solver
+- **Execution Time**: Average 0.356 seconds (real time), Std Dev ~0.016s, Min 0.345s, Max 0.384s (based on 5 runs)
+- **Accuracy**: Max error: 0.000011, L2 error: 0.000005 (maintained high accuracy)
+- **Improvement**: ~36% reduction from Version 2 (from 0.556s to 0.356s), ~53% from Version 1
+- **Note**: Direct solver provides exact solution without iterative optimization, leading to more consistent timing
+
 ### Previous Version (Before Vectorization)
 - **Execution Time**: Approximately 1.72 seconds (measured with cProfile on computation-only run, excluding plotting)
 - **Bottlenecks**: Python loops in constraints and evaluation, leading to inefficient scalar operations
 
 ### Current Version (After All Optimizations)
-- **Execution Time**: Average 0.556 seconds (real time), Std Dev 0.114s, Min 0.464s, Max 0.722s
-- **Improvement**: ~67% reduction in execution time (from ~1.72s to 0.556s average)
-- **Note**: cProfile adds overhead, so the actual runtime improvement is substantial. The vectorization allows NumPy to handle operations in compiled C code rather than interpreted Python loops.
+- **Execution Time**: Average 0.356 seconds (real time), Std Dev ~0.016s
+- **Overall Improvement**: ~79% reduction in execution time (from ~1.72s to 0.356s)
+- **Accuracy**: Maintained at max errors ~1e-5, L2 errors ~5e-6
 
 ## Profiling Methodology
 - Initial profiling used `cProfile` to identify bottlenecks in computation-only mode (with `--no-plot` flag).
@@ -47,13 +54,13 @@ This document summarizes the performance profiling and optimizations applied to 
 - All measurements taken on the same hardware and with identical parameters (25 FEM nodes, 8 LSSVR coefficients, gamma=1e4).
 
 ## Timing Statistics
-- **Average execution time**: 0.556 seconds
-- **Standard deviation**: 0.114 seconds  
-- **Minimum time**: 0.464 seconds
-- **Maximum time**: 0.722 seconds
-- **Outlier (excluded from stats)**: 1.715 seconds (likely due to system load)
+- **Average execution time**: 0.356 seconds
+- **Standard deviation**: ~0.016 seconds  
+- **Minimum time**: 0.345 seconds
+- **Maximum time**: 0.384 seconds
 - **Sample size**: 5 runs
-- **Improvement from initial version**: Approximately 2-3x faster due to vectorization and reduced training points.
+- **Improvement from Version 2**: Approximately 36% faster due to direct linear algebra solution
+- **Overall improvement from initial**: Approximately 4.8x faster
 
 ## Conclusion
 The optimizations successfully improved performance by:

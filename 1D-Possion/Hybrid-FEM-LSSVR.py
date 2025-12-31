@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.optimize import minimize
+from scipy.linalg import solve
 import matplotlib.pyplot as plt
 from numpy.polynomial.legendre import Legendre, leggauss
 from skfem import *
@@ -17,6 +18,109 @@ def main_boundary_condition_left(x):
 
 def main_boundary_condition_right(x):
     return 0.0  # u(1) = 0
+
+def build_legendre_matrices(M, training_points, xmin, xmax, domain_range):
+    """
+    Build matrices for Legendre polynomial constraints.
+    
+    Returns:
+    A: Matrix for PDE constraints (second derivatives at training points)
+    C: Matrix for boundary constraints (function values at boundaries)
+    """
+    # PDE constraint matrix: A * w = -u''(training_points)
+    A = np.zeros((len(training_points), M))
+    for i in range(M):
+        w = np.zeros(M)
+        w[i] = 1.0
+        u = Legendre(w, domain_range)
+        A[:, i] = -u.deriv(2)(training_points)
+    
+    # Boundary constraint matrix: C * w = [u(xmin), u(xmax)]
+    C = np.zeros((2, M))
+    for i in range(M):
+        w = np.zeros(M)
+        w[i] = 1.0
+        u = Legendre(w, domain_range)
+        C[0, i] = u(xmin)
+        C[1, i] = u(xmax)
+    
+    return A, C
+
+def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
+                       is_left_boundary=False, is_right_boundary=False, 
+                       global_domain_range=(-1, 1)):
+    """
+    LSSVR primal method using direct linear algebra solution instead of optimization.
+    
+    This solves the KKT system directly for much better performance.
+    """
+    xmin, xmax = domain_range
+    global_xmin, global_xmax = global_domain_range
+    
+    # Training points for PDE constraints
+    training_points = np.linspace(xmin, xmax, 8)
+    n_interior = len(training_points)
+    
+    # Build constraint matrices
+    A, C = build_legendre_matrices(M, training_points, xmin, xmax, domain_range)
+    
+    # Right-hand side for PDE constraints: A*w + e = f
+    f_vals = rhs_func(training_points)
+    b_pde = f_vals
+    
+    # Right-hand side for boundary constraints
+    if is_left_boundary and xmin == global_xmin:
+        bc_left = main_boundary_condition_left(global_xmin)
+    else:
+        bc_left = u_xmin
+        
+    if is_right_boundary and xmax == global_xmax:
+        bc_right = main_boundary_condition_right(global_xmax)
+    else:
+        bc_right = u_xmax
+        
+    b_bc = np.array([bc_left, bc_right])
+    
+    # Build KKT system matrix
+    # [ I + gamma*A^T*A    C^T ] [w] = [gamma*A^T*b_pde]
+    # [ C                   0   ] [μ]   [b_bc]
+    
+    kkt_matrix = np.block([
+        [np.eye(M) + gamma * A.T @ A, C.T],
+        [C, np.zeros((2, 2))]
+    ])
+    
+    kkt_rhs = np.concatenate([
+        gamma * A.T @ b_pde,
+        b_bc
+    ])
+    
+    # Solve the system
+    try:
+        solution = solve(kkt_matrix, kkt_rhs)
+        w = solution[:M]
+        mu = solution[M:M+2]  # Lagrange multipliers for BC
+        
+        # Compute slack variables: e = A*w - b_pde
+        e = A @ w - b_pde
+        
+        # Check constraint satisfaction
+        bc_violation = C @ w - b_bc
+        max_bc_violation = np.max(np.abs(bc_violation))
+        
+        if max_bc_violation > 1e-10:
+            print(f"Warning: Boundary constraint violation: {max_bc_violation}")
+        
+    except np.linalg.LinAlgError:
+        print("Warning: Linear system singular, using optimization fallback")
+        # Fallback to optimization
+        return lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
+                           is_left_boundary, is_right_boundary, global_domain_range)
+    
+    # Create Legendre polynomial approximation
+    u_lssvr = Legendre(w, domain_range)
+    
+    return u_lssvr
 
 def lssvr_primal(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
                  is_left_boundary=False, is_right_boundary=False, 
@@ -161,7 +265,7 @@ class FEMLSSVRPrimalSolver:
             
             # Solve LSSVR with primal method for this element
             try:
-                lssvr_func = lssvr_primal(
+                lssvr_func = lssvr_primal_direct(
                     poisson_rhs, [x_start, x_end], u_left, u_right, 
                     self.lssvr_M, self.lssvr_gamma,
                     is_left_boundary=is_left_boundary,
