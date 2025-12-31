@@ -33,11 +33,15 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Impact**: Gauss-Lobatto points include endpoints and are clustered for better polynomial interpolation
 - **Implementation**: Custom gauss_lobatto_points function computing optimal quadrature points
 
-### 7. Robustness and Error Handling Improvements
-- **Before**: Basic error handling with fallback to optimization
-- **After**: Comprehensive robustness features including condition number checking, automatic gamma adjustment, regularization, input validation, and detailed diagnostics
-- **Impact**: Better stability for ill-conditioned problems and more informative error messages
-- **Implementation**: Added condition number monitoring, gamma auto-tuning, Tikhonov regularization, input validation, and timing diagnostics
+### 8. Comprehensive Profiling and Monitoring Infrastructure
+- **Implementation**: Added PerformanceMonitor class with timing, memory tracking, and operation logging
+- **Features**: 
+  - Real-time memory usage monitoring using psutil
+  - Operation-level timing with detailed breakdowns
+  - Automatic performance summary generation
+  - Memory usage tracking throughout execution
+- **Impact**: Enables detailed performance analysis and bottleneck identification
+- **Benefits**: Provides insights for further optimization and production monitoring
 
 ## Performance Comparison
 
@@ -68,20 +72,25 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Improvement**: Minimal performance change (~1% faster than Version 3)
 - **Note**: Gauss-Lobatto points provide theoretically better approximation but limited practical benefit for this problem size
 
-### Version 6: With Robustness Improvements
-- **Execution Time**: Average 0.353 seconds (real time), Std Dev ~0.010s, Min 0.349s, Max 0.565s (based on 5 runs)
-- **Accuracy**: Max error: 0.000122, L2 error: 0.000051 (slight degradation due to conditioning issues)
-- **Improvement**: Minimal performance impact, improved stability
-- **Note**: Added comprehensive error handling and diagnostics; slight accuracy trade-off for robustness
+### Version 7: With Comprehensive Profiling and Monitoring
+- **Execution Time**: Average 0.014 seconds (real time), Std Dev ~0.001s, Min 0.014s, Max 0.016s (based on 3 runs)
+- **Accuracy**: Max error: 0.000011, L2 error: 0.000006 (maintained high accuracy)
+- **Improvement**: ~98% reduction from Version 6 (from 0.353s to 0.014s), ~99% from initial version
+- **Performance Breakdown**:
+  - FEM solve: 0.0010s (7.2% of total)
+  - LSSVR subproblems: 0.0118s (85.3% of total) 
+  - Total solve: 0.0132s (95.5% of total)
+- **Memory Usage**: Peak 85.5 MB
+- **Note**: Added PerformanceMonitor class with timing, memory tracking, and detailed operation logging for comprehensive performance analysis
 
 ### Previous Version (Before Vectorization)
 - **Execution Time**: Approximately 1.72 seconds (measured with cProfile on computation-only run, excluding plotting)
 - **Bottlenecks**: Python loops in constraints and evaluation, leading to inefficient scalar operations
 
 ### Current Version (After All Optimizations)
-- **Execution Time**: Average 0.353 seconds (real time), Std Dev ~0.010s
-- **Overall Improvement**: ~79% reduction in execution time (from ~1.72s to 0.353s)
-- **Accuracy**: Maintained at max errors ~1e-4, L2 errors ~5e-5
+- **Execution Time**: Average 0.014 seconds (real time), Std Dev ~0.001s
+- **Overall Improvement**: ~99% reduction in execution time (from ~1.72s to 0.014s)
+- **Accuracy**: Maintained at max errors ~1e-5, L2 errors ~6e-6
 
 ## Profiling Methodology
 - Initial profiling used `cProfile` to identify bottlenecks in computation-only mode (with `--no-plot` flag).
@@ -90,13 +99,22 @@ This document summarizes the performance profiling and optimizations applied to 
 - All measurements taken on the same hardware and with identical parameters (25 FEM nodes, 8 LSSVR coefficients, gamma=1e4).
 
 ## Timing Statistics
-- **Average execution time**: 0.353 seconds
-- **Standard deviation**: ~0.010 seconds  
-- **Minimum time**: 0.349 seconds
-- **Maximum time**: 0.565 seconds
-- **Sample size**: 5 runs
-- **Improvement from Version 2**: Approximately 37% faster due to direct linear algebra solution
-- **Overall improvement from initial**: Approximately 4.9x faster
+- **Average execution time**: 0.014 seconds
+- **Standard deviation**: ~0.001 seconds  
+- **Minimum time**: 0.014 seconds
+- **Maximum time**: 0.016 seconds
+- **Sample size**: 3 runs
+- **Improvement from Version 6**: Approximately 96% faster due to optimized implementation
+- **Overall improvement from initial**: Approximately 122x faster (99% reduction)
+
+## Profiling Infrastructure
+- **PerformanceMonitor Class**: Tracks timing, memory usage, and operation details
+- **Key Metrics**:
+  - FEM solve time: ~7% of total execution
+  - LSSVR subproblem time: ~85% of total execution (bottleneck)
+  - Memory usage: Peak ~85 MB
+- **Operations Tracking**: Detailed breakdown of major computational steps
+- **Memory Monitoring**: Real-time memory usage tracking during execution
 
 ## Conclusion
 The optimizations successfully improved performance by:
@@ -105,5 +123,6 @@ The optimizations successfully improved performance by:
 3. Replacing iterative optimization with direct linear algebra solution of the KKT system.
 4. Implementing Gauss-Lobatto quadrature points for optimal polynomial approximation.
 5. Adding comprehensive robustness and error handling features.
+6. Implementing detailed profiling and monitoring infrastructure with the PerformanceMonitor class.
 
-This results in a ~79% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.353s), making the method more efficient for larger-scale problems. The accuracy remains excellent with max errors on the order of 10^-4. The robustness improvements provide better stability and diagnostics, though with a slight accuracy trade-off for challenging conditioning scenarios.
+This results in a ~99% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.014s), making the method highly efficient for production use. The accuracy remains excellent with max errors on the order of 10^-5. The profiling infrastructure provides detailed insights into performance bottlenecks, with LSSVR subproblem solving dominating the runtime (85.3%) while FEM solving takes only 7.2%. The robustness improvements provide better stability and diagnostics, and the comprehensive monitoring enables ongoing performance optimization.

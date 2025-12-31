@@ -6,6 +6,62 @@ from numpy.polynomial.legendre import Legendre, leggauss
 from skfem import *
 from skfem.helpers import dot, grad
 import argparse
+import time
+import psutil
+import os
+
+class PerformanceMonitor:
+    """Monitor performance metrics during execution."""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.start_time = time.time()
+        self.fem_time = 0
+        self.lssvr_time = 0
+        self.element_times = []
+        self.memory_usage = []
+        self.operations = []
+    
+    def record_operation(self, operation_name, duration, details=None):
+        """Record a completed operation."""
+        self.operations.append({
+            'name': operation_name,
+            'duration': duration,
+            'timestamp': time.time() - self.start_time,
+            'details': details
+        })
+    
+    def get_memory_usage(self):
+        """Get current memory usage in MB."""
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    
+    def print_summary(self):
+        """Print performance summary."""
+        total_time = time.time() - self.start_time
+        print(f"\n{'='*50}")
+        print("PERFORMANCE SUMMARY")
+        print(f"{'='*50}")
+        print(f"Total execution time: {total_time:.4f} seconds")
+        if hasattr(self, 'fem_time') and self.fem_time:
+            print(f"FEM solve time: {self.fem_time:.4f} seconds ({self.fem_time/total_time*100:.1f}%)")
+        if hasattr(self, 'lssvr_total_time') and self.lssvr_total_time:
+            print(f"LSSVR solve time: {self.lssvr_total_time:.4f} seconds ({self.lssvr_total_time/total_time*100:.1f}%)")
+        if hasattr(self, 'total_solve_time') and self.total_solve_time:
+            print(f"Total solve time: {self.total_solve_time:.4f} seconds ({self.total_solve_time/total_time*100:.1f}%)")
+        print(f"Number of operations recorded: {len(self.operations)}")
+        if self.operations:
+            print("Operations breakdown:")
+            for op in self.operations:
+                print(f"  {op['name']}: {op['duration']:.6f}s ({op['details']})")
+        if self.memory_usage:
+            print(f"Peak memory usage: {np.max(self.memory_usage):.1f} MB")
+        print(f"{'='*50}\n")
+
+# Global performance monitor
+monitor = PerformanceMonitor()
 
 def true_solution(x):
     return np.sin(np.pi * x)
@@ -250,6 +306,9 @@ class FEMLSSVRPrimalSolver:
         
     def solve_fem(self):
         """Solve using FEM to get coarse solution."""
+        fem_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         # Create mesh and basis
         m = MeshLine(np.linspace(self.global_domain[0], self.global_domain[1], self.num_fem_nodes))
         element_p = ElementLineP1()
@@ -271,6 +330,11 @@ class FEMLSSVRPrimalSolver:
         A, b = enforce(A, b, D=basis.get_dofs())
         u_fem = solve(A, b)
         
+        fem_time = time.time() - fem_start
+        monitor.fem_time = fem_time
+        monitor.record_operation('FEM_solve', fem_time, f'nodes={self.num_fem_nodes}')
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         # Get node values
         interpolator = basis.interpolator(u_fem)
         self.fem_nodes = m.p[0]
@@ -280,6 +344,9 @@ class FEMLSSVRPrimalSolver:
     
     def solve_lssvr_subproblems(self):
         """Solve LSSVR with primal method in each element."""
+        lssvr_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         self.lssvr_functions = []
         
         for i in range(len(self.fem_nodes) - 1):
@@ -308,11 +375,24 @@ class FEMLSSVRPrimalSolver:
                 def linear_fallback(x):
                     return u_left + (u_right - u_left) * (x - x_start) / (x_end - x_start)
                 self.lssvr_functions.append(linear_fallback)
+        
+        lssvr_time = time.time() - lssvr_start
+        monitor.lssvr_total_time = lssvr_time
+        monitor.record_operation('LSSVR_subproblems', lssvr_time, f'elements={len(self.lssvr_functions)}')
+        monitor.memory_usage.append(monitor.get_memory_usage())
     
     def solve(self):
         """Complete solution: FEM + LSSVR."""
+        solve_start = time.time()
+        monitor.memory_usage.append(monitor.get_memory_usage())
+        
         self.solve_fem()
         self.solve_lssvr_subproblems()
+        
+        solve_time = time.time() - solve_start
+        monitor.total_solve_time = solve_time
+        monitor.record_operation('Total_solve', solve_time, 'FEM + LSSVR')
+        monitor.memory_usage.append(monitor.get_memory_usage())
 
     
     def evaluate_solution(self, x_points):
@@ -337,6 +417,9 @@ if __name__ == "__main__":
     parser.add_argument('--no-plot', action='store_true', help='Skip plotting the results.')
     args = parser.parse_args()
     
+    # Initialize performance monitoring
+    monitor.reset()
+    
     # Parameters
     num_nodes = 25
     test_points = np.linspace(-1, 1, 201)
@@ -352,9 +435,12 @@ if __name__ == "__main__":
     # Calculate errors
     error = np.abs(computed_solution - exact_solution)
     max_error = np.max(error)
-    l2_error = np.sqrt(np.trapezoid(error**2, test_points))
+    l2_error = np.sqrt(np.trapz(error**2, test_points))
     print(f"Max error: {max_error:.6f}")
     print(f"L2 error: {l2_error:.6f}")
+    
+    # Print performance summary
+    monitor.print_summary()
     
     if not args.no_plot:
         # plot of solution
