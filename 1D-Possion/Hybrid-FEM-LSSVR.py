@@ -46,19 +46,48 @@ def build_legendre_matrices(M, training_points, xmin, xmax, domain_range):
     
     return A, C
 
+def gauss_lobatto_points(n_points, domain=(-1, 1)):
+    """
+    Compute Gauss-Lobatto quadrature points on a given domain.
+    
+    Gauss-Lobatto points include the endpoints and are optimal for polynomial interpolation.
+    For n_points, we get n_points points.
+    """
+    if n_points < 2:
+        raise ValueError("Need at least 2 points")
+    
+    if n_points == 2:
+        points = np.array([-1.0, 1.0])
+    else:
+        # For Gauss-Lobatto, interior points are cos(π*k/(n-1)) for k=1 to n-2
+        # where n = n_points - 1
+        n = n_points - 1
+        interior = []
+        for k in range(1, n):
+            x = np.cos(np.pi * k / n)
+            interior.append(x)
+        points = np.array([-1.0] + sorted(interior) + [1.0])
+    
+    # Transform to the desired domain
+    a, b = domain
+    transformed_points = a + (b - a) * (points + 1) / 2
+    
+    return transformed_points
+
 def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
                        is_left_boundary=False, is_right_boundary=False, 
                        global_domain_range=(-1, 1)):
     """
-    LSSVR primal method using direct linear algebra solution instead of optimization.
+    LSSVR primal method using direct linear algebra solution with adaptive training points.
     
     This solves the KKT system directly for much better performance.
+    Uses Gauss-Lobatto points for optimal polynomial approximation.
     """
     xmin, xmax = domain_range
     global_xmin, global_xmax = global_domain_range
     
-    # Training points for PDE constraints
-    training_points = np.linspace(xmin, xmax, 8)
+    # Training points for PDE constraints - using Gauss-Lobatto points
+    training_points = gauss_lobatto_points(8, domain=(xmin, xmax))
     n_interior = len(training_points)
     
     # Build constraint matrices

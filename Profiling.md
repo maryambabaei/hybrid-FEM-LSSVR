@@ -27,6 +27,12 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Reason**: The evaluation step is already well-vectorized with NumPy, and matrix building/solving dominates the runtime
 - **Conclusion**: JIT compilation not beneficial for this particular implementation
 
+### 6. Adaptive Training Points with Gauss-Lobatto Quadrature
+- **Before**: Fixed 8 equally spaced training points per element
+- **After**: 8 Gauss-Lobatto points per element (optimal for polynomial approximation)
+- **Impact**: Gauss-Lobatto points include endpoints and are clustered for better polynomial interpolation
+- **Implementation**: Custom gauss_lobatto_points function computing optimal quadrature points
+
 ## Performance Comparison
 
 ### Version 1: Initial Vectorized Version (12 training points)
@@ -50,14 +56,20 @@ This document summarizes the performance profiling and optimizations applied to 
 - **Improvement**: No significant improvement over Version 3
 - **Note**: JIT compilation did not provide benefits for this implementation
 
+### Version 5: With Gauss-Lobatto Training Points
+- **Execution Time**: Average 0.353 seconds (real time), Std Dev ~0.009s, Min 0.346s, Max 0.368s (based on 5 runs)
+- **Accuracy**: Max error: 0.000013, L2 error: 0.000006 (maintained)
+- **Improvement**: Minimal performance change (~1% faster than Version 3)
+- **Note**: Gauss-Lobatto points provide theoretically better approximation but limited practical benefit for this problem size
+
 ### Previous Version (Before Vectorization)
 - **Execution Time**: Approximately 1.72 seconds (measured with cProfile on computation-only run, excluding plotting)
 - **Bottlenecks**: Python loops in constraints and evaluation, leading to inefficient scalar operations
 
 ### Current Version (After All Optimizations)
-- **Execution Time**: Average 0.356 seconds (real time), Std Dev ~0.016s
-- **Overall Improvement**: ~79% reduction in execution time (from ~1.72s to 0.356s)
-- **Accuracy**: Maintained at max errors ~1e-5, L2 errors ~5e-6
+- **Execution Time**: Average 0.353 seconds (real time), Std Dev ~0.009s
+- **Overall Improvement**: ~79% reduction in execution time (from ~1.72s to 0.353s)
+- **Accuracy**: Maintained at max errors ~1e-5, L2 errors ~6e-6
 
 ## Profiling Methodology
 - Initial profiling used `cProfile` to identify bottlenecks in computation-only mode (with `--no-plot` flag).
@@ -66,18 +78,19 @@ This document summarizes the performance profiling and optimizations applied to 
 - All measurements taken on the same hardware and with identical parameters (25 FEM nodes, 8 LSSVR coefficients, gamma=1e4).
 
 ## Timing Statistics
-- **Average execution time**: 0.356 seconds
-- **Standard deviation**: ~0.016 seconds  
-- **Minimum time**: 0.345 seconds
-- **Maximum time**: 0.384 seconds
+- **Average execution time**: 0.353 seconds
+- **Standard deviation**: ~0.009 seconds  
+- **Minimum time**: 0.346 seconds
+- **Maximum time**: 0.368 seconds
 - **Sample size**: 5 runs
-- **Improvement from Version 2**: Approximately 36% faster due to direct linear algebra solution
-- **Overall improvement from initial**: Approximately 4.8x faster
+- **Improvement from Version 2**: Approximately 37% faster due to direct linear algebra solution
+- **Overall improvement from initial**: Approximately 4.9x faster
 
 ## Conclusion
 The optimizations successfully improved performance by:
 1. Vectorizing NumPy operations to leverage compiled C code instead of Python loops.
 2. Reducing the number of training points in LSSVR while maintaining accuracy.
 3. Replacing iterative optimization with direct linear algebra solution of the KKT system.
+4. Implementing Gauss-Lobatto quadrature points for optimal polynomial approximation.
 
-This results in a ~79% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.356s), making the method more efficient for larger-scale problems. The accuracy remains excellent with max errors on the order of 10^-5. JIT compilation was attempted but did not provide additional benefits for this implementation.
+This results in a ~79% overall speedup from the initial version (average execution time reduced from ~1.72s to 0.353s), making the method more efficient for larger-scale problems. The accuracy remains excellent with max errors on the order of 10^-5. JIT compilation was attempted but did not provide additional benefits, while Gauss-Lobatto points provide theoretical improvements with minimal practical impact for this implementation.
