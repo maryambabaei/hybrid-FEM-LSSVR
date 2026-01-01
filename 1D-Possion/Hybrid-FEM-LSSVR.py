@@ -16,6 +16,43 @@ from numba import jit
 from multiprocessing import Pool, cpu_count
 import multiprocessing as mp
 
+# Memory Pool for array recycling - reduces allocation overhead
+class ArrayPool:
+    """Simple memory pool to recycle numpy arrays and reduce allocation overhead."""
+    
+    def __init__(self):
+        self.pools = {}  # (shape, dtype) -> list of arrays
+    
+    def get_array(self, shape, dtype=np.float64, fill_val=None):
+        """Get a recycled array or create new one."""
+        key = (tuple(shape) if hasattr(shape, '__iter__') else (shape,), dtype)
+        
+        if key in self.pools and self.pools[key]:
+            arr = self.pools[key].pop()
+            if fill_val is not None:
+                arr.fill(fill_val)
+            return arr
+        
+        # Create new array
+        arr = np.empty(shape, dtype=dtype)
+        if fill_val is not None:
+            arr.fill(fill_val)
+        return arr
+    
+    def return_array(self, arr):
+        """Return array to pool for reuse."""
+        if arr is None:
+            return
+        key = (tuple(arr.shape), arr.dtype)
+        if key not in self.pools:
+            self.pools[key] = []
+        # Limit pool size to prevent memory bloat
+        if len(self.pools[key]) < 10:
+            self.pools[key].append(arr)
+
+# Global array pool instance
+array_pool = ArrayPool()
+
 # Try to import Cython extension
 try:
     from legendre_matrices_cython import build_legendre_matrices_cython
@@ -150,12 +187,17 @@ def _parallel_lssvr_worker(args):
         
         solutions, _ = solve_lssvr_batch_optimized(A, C, f_vals_batch, b_bc_batch, M, gamma)
         
-        # Create Legendre polynomials
-        for i in range(batch_size):
-            w = solutions[i, :M]
-            domain_range_i = [x_starts[i], x_ends[i]]
-            u_lssvr = Legendre(w, domain_range_i)
-            batch_functions.append(u_lssvr)
+        # Create Legendre polynomials using FastLegendrePolynomial
+        if USE_FAST_POLYNOMIAL:
+            batch_functions = create_fast_legendre_polynomials_batch(
+                solutions, x_starts, x_ends, M
+            )
+        else:
+            for i in range(batch_size):
+                w = solutions[i, :M]
+                domain_range_i = [x_starts[i], x_ends[i]]
+                u_lssvr = Legendre(w, domain_range_i)
+                batch_functions.append(u_lssvr)
     else:
         # Non-uniform path (rare for large systems)
         A_ref, C_ref, xi_points = build_reference_legendre_matrices(M, n_training)
@@ -185,7 +227,10 @@ def _parallel_lssvr_worker(args):
             
             solution, _ = solve_lssvr_system(A, C, f_vals, b_bc, M, gamma)
             w = solution[:M]
-            u_lssvr = Legendre(w, [x_starts[i], x_ends[i]])
+            if USE_FAST_POLYNOMIAL:
+                u_lssvr = FastLegendrePolynomial(w, (x_starts[i], x_ends[i]))
+            else:
+                u_lssvr = Legendre(w, [x_starts[i], x_ends[i]])
             batch_functions.append(u_lssvr)
     
     return (batch_idx, batch_functions)
@@ -747,8 +792,8 @@ def solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma):
     from scipy.sparse.linalg import spsolve
 
     # Pre-compute common matrices - use optimized dot products
-    ATA = np.dot(A.T, A)  # Use dot for better performance than @
-    ATb = np.dot(A.T, b_pde)
+    ATA = A.T @ A  # Use @ for better SIMD performance
+    ATb = A.T @ b_pde
 
     # Main block: I + gamma*A^T*A (pre-compute and reuse)
     main_block = np.eye(M, dtype=np.float64)
@@ -1879,10 +1924,13 @@ class FEMLSSVRPrimalSolver:
             with Pool(processes=n_workers) as pool:
                 results = pool.map(_parallel_lssvr_worker, batch_args)
 
-            # Sort results by batch index and collect functions
+            # Sort results by batch index and insert functions at correct positions
             results.sort(key=lambda x: x[0])
-            for _, batch_functions in results:
-                self.lssvr_functions.extend(batch_functions)
+            for batch_idx, batch_functions in results:
+                batch_start = batch_idx * batch_size
+                for i, func in enumerate(batch_functions):
+                    if batch_start + i < n_elements:  # Safety check
+                        self.lssvr_functions[batch_start + i] = func
 
             # Estimate timing (parallel execution)
             total_batch_time = time.time() - lssvr_start

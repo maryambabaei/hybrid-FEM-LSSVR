@@ -248,29 +248,43 @@ def interpolate_solution_cython(double[:] nodes, double[:] values, double[:] eva
 # LIGHTWEIGHT POLYNOMIAL CLASS - ULTRA-FAST REPLACEMENT FOR numpy.Legendre
 # ============================================================================
 
+def _reconstruct_fast_legendre(coef_array, a, b):
+    """Reconstruction function for unpickling FastLegendrePolynomial."""
+    return FastLegendrePolynomial(coef_array, (a, b))
+
 cdef class FastLegendrePolynomial:
     """
     Lightweight Legendre polynomial class - 10x faster than numpy.Legendre.
     
     Stores only coefficients and domain, no heavy numpy polynomial overhead.
     Evaluation uses direct Legendre basis computation in C.
+    Pickle-able for multiprocessing support.
     """
     cdef double[:] coef
     cdef double a, b  # domain [a, b]
     cdef int degree
     
-    def __init__(self, double[:] coefficients, tuple domain):
+    def __init__(self, coefficients, tuple domain):
         """
         Initialize polynomial.
         
         Args:
-            coefficients: Legendre coefficients [c0, c1, ..., cM-1]
+            coefficients: Legendre coefficients [c0, c1, ..., cM-1] (numpy array or memoryview)
             domain: (a, b) domain tuple
         """
+        # Fast path: assume coefficients is already numpy array (most common case)
+        # This avoids isinstance check overhead in hot path
         self.coef = coefficients
         self.a = domain[0]
         self.b = domain[1]
-        self.degree = coefficients.shape[0]
+        self.degree = len(coefficients)
+    
+    def __reduce__(self):
+        """Support for pickling (required for multiprocessing)."""
+        return (
+            _reconstruct_fast_legendre,
+            (np.asarray(self.coef), self.a, self.b)
+        )
     
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -345,6 +359,35 @@ cdef class FastLegendrePolynomial:
 # Batch polynomial creation function - eliminates Python loop overhead
 @cython.boundscheck(False)
 @cython.wraparound(False)
+def create_fast_legendre_polynomials_batch(double[:, :] solutions, double[:] x_starts, double[:] x_ends, int M):
+    """
+    Create list of FastLegendrePolynomial objects for entire batch.
+    
+    Args:
+        solutions: (batch_size, M+2) array of LSSVR solutions
+        x_starts: (batch_size,) array of element start coordinates  
+        x_ends: (batch_size,) array of element end coordinates
+        M: Number of Legendre coefficients
+    
+    Returns:
+        List of FastLegendrePolynomial objects
+    """
+    cdef int batch_size = solutions.shape[0]
+    cdef int i
+    cdef list polynomials = []
+    
+    for i in range(batch_size):
+        # Extract coefficients for this element
+        w = solutions[i, :M]
+        domain = (x_starts[i], x_ends[i])
+        
+        # Create polynomial object
+        poly = FastLegendrePolynomial(w, domain)
+        polynomials.append(poly)
+    
+    return polynomials
+
+
 def create_fast_legendre_polynomials_batch(double[:, :] solutions, double[:] x_starts, double[:] x_ends, int M):
     """
     Create list of FastLegendrePolynomial objects for entire batch.
