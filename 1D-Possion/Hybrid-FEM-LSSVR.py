@@ -978,21 +978,24 @@ def solve_lssvr_system(A, C, b_pde, b_bc, M, gamma):
     """
     Unified LSSVR system solver with automatic method selection.
 
-    Tries sparse representations first for larger systems, falls back to dense optimized solvers.
+    Adaptive strategy based on problem size:
+    - M <= 15: Dense Cholesky+Schur (fastest for small systems)
+    - M > 15: Sparse iterative solvers (better for large systems)
     """
-    # For small systems, dense solver is more efficient
-    if M <= 10:
-        return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+    # For small to medium systems, dense Cholesky solver is fastest
+    # Sparse overhead (bmat construction) dominates for M <= 15
+    if M <= 15:
+        return solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma)
     else:
-        # Try sparse first for larger systems
+        # For larger systems, try sparse first
         try:
             return solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma)
         except ImportError:
             # scipy.sparse not available
-            return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+            return solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma)
         except Exception as e:
             print(f"Sparse solver failed: {e}, using dense solver")
-            return solve_lssvr_system_dense(A, C, b_pde, b_bc, M, gamma)
+            return solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma)
 
 def lssvr_primal_direct(rhs_func, domain_range, u_xmin, u_xmax, M, gamma, 
                        is_left_boundary=False, is_right_boundary=False, 
