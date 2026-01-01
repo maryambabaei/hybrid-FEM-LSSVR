@@ -102,6 +102,16 @@ class PerformanceMonitor:
                 print(f"  {op['name']}: {op['duration']:.6f}s ({op['details']})")
         if self.memory_usage:
             print(f"Peak memory usage: {np.max(self.memory_usage):.1f} MB")
+        
+        # Cache statistics
+        global _cache_hits, _cache_misses
+        if _cache_hits + _cache_misses > 0:
+            cache_hit_rate = 100 * _cache_hits / (_cache_hits + _cache_misses)
+            print(f"\nCache Performance:")
+            print(f"  Legendre cache hits: {_cache_hits}")
+            print(f"  Legendre cache misses: {_cache_misses}")
+            print(f"  Cache hit rate: {cache_hit_rate:.1f}%")
+        
         print(f"{'='*50}\n")
 
 # Global performance monitor
@@ -243,85 +253,175 @@ def build_legendre_matrices_vectorized(M, training_points, xmin, xmax, domain_ra
 
     return A, C
 
+# Global cache for Legendre matrix computations
+_legendre_cache = {}
+_cache_hits = 0
+_cache_misses = 0
+
+# Try to use Numba for JIT compilation of critical functions
+try:
+    from numba import jit
+    USE_NUMBA = True
+    
+    @jit(nopython=True, cache=True)
+    def _compute_legendre_A_matrix_numba(x_scaled, M, deriv_scale):
+        """Numba-optimized A matrix computation."""
+        n_points = len(x_scaled)
+        A = np.zeros((n_points, M), dtype=np.float64)
+        
+        # Vectorized operations for first 6 polynomials
+        if M > 2:
+            A[:, 2] = -3.0 * deriv_scale
+        if M > 3:
+            A[:, 3] = -15.0 * x_scaled * deriv_scale
+        if M > 4:
+            x2 = x_scaled * x_scaled
+            A[:, 4] = (-52.5 * x2 + 7.5) * deriv_scale
+        if M > 5:
+            x3 = x_scaled * x_scaled * x_scaled
+            A[:, 5] = (-157.5 * x3 + 52.5 * x_scaled) * deriv_scale
+        
+        return A
+    
+    @jit(nopython=True, cache=True)
+    def _compute_legendre_C_matrix_numba(xmin_scaled, xmax_scaled, M):
+        """Numba-optimized C matrix computation."""
+        C = np.zeros((2, M), dtype=np.float64)
+        
+        # P_0(x) = 1
+        C[0, 0] = 1.0
+        C[1, 0] = 1.0
+        
+        if M > 1:
+            # P_1(x) = x
+            C[0, 1] = xmin_scaled
+            C[1, 1] = xmax_scaled
+        
+        if M > 2:
+            # P_2(x) = (3x²-1)/2
+            C[0, 2] = 0.5 * (3 * xmin_scaled**2 - 1)
+            C[1, 2] = 0.5 * (3 * xmax_scaled**2 - 1)
+        
+        if M > 3:
+            # P_3(x) = (5x³-3x)/2
+            C[0, 3] = 0.5 * (5 * xmin_scaled**3 - 3 * xmin_scaled)
+            C[1, 3] = 0.5 * (5 * xmax_scaled**3 - 3 * xmax_scaled)
+        
+        return C
+    
+except ImportError:
+    USE_NUMBA = False
+    print("Numba not available, using standard NumPy operations")
+
 def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
     """
-    Optimized JIT version of build_legendre_matrices with reduced object creation.
+    Optimized JIT version with caching for repeated domain computations.
+    Cache is based on element length, not absolute position, since Legendre
+    matrices only depend on the size of the domain, not its location.
     """
+    global _cache_hits, _cache_misses
+    
     a, b = domain_range
     n_points = len(training_points)
-
-    # Pre-compute domain transformation factors
-    scale_factor = 2.0 / (b - a)
-    shift_factor = (a + b) / (a - b)
+    element_length = b - a
+    
+    # Create cache key based on element LENGTH (not absolute position) and M
+    # This allows cache hits for uniform meshes where all elements have same size
+    cache_key = (element_length, M, n_points)
+    
+    # Check cache for pre-computed transformation factors
+    if cache_key in _legendre_cache:
+        _cache_hits += 1
+        scale_factor, shift_factor_template, deriv_scale, C_template = _legendre_cache[cache_key]
+        # Compute actual shift factor for this specific element position
+        shift_factor = (a + b) / (a - b)
+    else:
+        _cache_misses += 1
+        # Pre-compute domain transformation factors
+        scale_factor = 2.0 / (b - a)
+        shift_factor_template = 0.0  # Will be computed per-element
+        shift_factor = (a + b) / (a - b)
+        # Scaling factor for second derivatives
+        deriv_scale = scale_factor * scale_factor
+        C_template = None  # Will be computed below
 
     # Transform points to [-1, 1] domain
     x_scaled = scale_factor * training_points + shift_factor
     xmin_scaled = scale_factor * xmin + shift_factor
     xmax_scaled = scale_factor * xmax + shift_factor
 
-    # Scaling factor for second derivatives
-    deriv_scale = scale_factor * scale_factor
+    A = np.zeros((n_points, M), dtype=np.float64)
+    C = np.zeros((2, M), dtype=np.float64)
 
-    A = np.zeros((n_points, M))
-    C = np.zeros((2, M))
+    # Use Numba-optimized version if available and M <= 6
+    if USE_NUMBA and M <= 6:
+        A = _compute_legendre_A_matrix_numba(x_scaled, M, deriv_scale)
+        C = _compute_legendre_C_matrix_numba(xmin_scaled, xmax_scaled, M)
+    else:
+        # Build A matrix (second derivatives) - vectorized where possible
+        for i in range(M):
+            if i == 0:
+                A[:, 0] = 0.0  # P_0'' = 0
+            elif i == 1:
+                A[:, 1] = 0.0  # P_1'' = 0
+            elif i == 2:
+                A[:, 2] = -3.0 * deriv_scale  # P_2''(x) = 3, scaled
+            elif i == 3:
+                A[:, 3] = -15.0 * x_scaled * deriv_scale  # P_3''(x) = 15x, scaled
+            elif i == 4:
+                x2 = x_scaled * x_scaled
+                A[:, 4] = (-52.5 * x2 + 7.5) * deriv_scale  # P_4''(x) = 52.5x² - 7.5, scaled
+            elif i == 5:
+                x3 = x2 * x_scaled
+                A[:, 5] = (-157.5 * x3 + 52.5 * x_scaled) * deriv_scale  # P_5''(x) = 157.5x³ - 52.5x, scaled
+            else:
+                # For higher polynomials, fall back to numpy (less common case)
+                coeffs = np.zeros(M)
+                coeffs[i] = 1.0
+                u = Legendre(coeffs, domain=(-1, 1))
+                u_deriv2 = u.deriv(2)
+                A[:, i] = -u_deriv2(x_scaled) * deriv_scale
 
-    # Build A matrix (second derivatives) - vectorized where possible
-    for i in range(M):
-        if i == 0:
-            A[:, 0] = 0.0  # P_0'' = 0
-        elif i == 1:
-            A[:, 1] = 0.0  # P_1'' = 0
-        elif i == 2:
-            A[:, 2] = -3.0 * deriv_scale  # P_2''(x) = 3, scaled
-        elif i == 3:
-            A[:, 3] = -15.0 * x_scaled * deriv_scale  # P_3''(x) = 15x, scaled
-        elif i == 4:
-            x2 = x_scaled * x_scaled
-            A[:, 4] = (-52.5 * x2 + 7.5) * deriv_scale  # P_4''(x) = 52.5x² - 7.5, scaled
-        elif i == 5:
-            x3 = x2 * x_scaled
-            A[:, 5] = (-157.5 * x3 + 52.5 * x_scaled) * deriv_scale  # P_5''(x) = 157.5x³ - 52.5x, scaled
-        else:
-            # For higher polynomials, fall back to numpy (less common case)
-            coeffs = np.zeros(M)
-            coeffs[i] = 1.0
-            u = Legendre(coeffs, domain=(-1, 1))
-            u_deriv2 = u.deriv(2)
-            A[:, i] = -u_deriv2(x_scaled) * deriv_scale
-
-    # Build C matrix (boundary values) - also optimized
-    for i in range(M):
-        if i == 0:
-            C[0, 0] = 1.0
-            C[1, 0] = 1.0
-        elif i == 1:
-            C[0, 1] = xmin_scaled
-            C[1, 1] = xmax_scaled
-        elif i == 2:
-            # P_2(x) = (3x²-1)/2
-            p2_min = 0.5 * (3 * xmin_scaled**2 - 1)
-            p2_max = 0.5 * (3 * xmax_scaled**2 - 1)
-            C[0, 2] = p2_min
-            C[1, 2] = p2_max
-        elif i == 3:
-            # P_3(x) = (5x³-3x)/2
-            p3_min = 0.5 * (5 * xmin_scaled**3 - 3 * xmin_scaled)
-            p3_max = 0.5 * (5 * xmax_scaled**3 - 3 * xmax_scaled)
-            C[0, 3] = p3_min
-            C[1, 3] = p3_max
-        else:
-            # For higher polynomials, use numpy
-            coeffs = np.zeros(M)
-            coeffs[i] = 1.0
-            u = Legendre(coeffs, domain=(-1, 1))
-            C[0, i] = u(xmin_scaled)
-            C[1, i] = u(xmax_scaled)
-
+        # Build C matrix (boundary values) - also optimized
+        for i in range(M):
+            if i == 0:
+                C[0, 0] = 1.0
+                C[1, 0] = 1.0
+            elif i == 1:
+                C[0, 1] = xmin_scaled
+                C[1, 1] = xmax_scaled
+            elif i == 2:
+                # P_2(x) = (3x²-1)/2
+                p2_min = 0.5 * (3 * xmin_scaled**2 - 1)
+                p2_max = 0.5 * (3 * xmax_scaled**2 - 1)
+                C[0, 2] = p2_min
+                C[1, 2] = p2_max
+            elif i == 3:
+                # P_3(x) = (5x³-3x)/2
+                p3_min = 0.5 * (5 * xmin_scaled**3 - 3 * xmin_scaled)
+                p3_max = 0.5 * (5 * xmax_scaled**3 - 3 * xmax_scaled)
+                C[0, 3] = p3_min
+                C[1, 3] = p3_max
+            else:
+                # For higher polynomials, use numpy
+                coeffs = np.zeros(M)
+                coeffs[i] = 1.0
+                u = Legendre(coeffs, domain=(-1, 1))
+                C[0, i] = u(xmin_scaled)
+                C[1, i] = u(xmax_scaled)
+    
+    # Cache transformation factors for reuse (store template shift_factor for reference)
+    if cache_key not in _legendre_cache:
+        _legendre_cache[cache_key] = (scale_factor, shift_factor_template, deriv_scale, C.copy())
+    
     return A, C
+
+# Global cache for Gauss-Lobatto points
+_gauss_lobatto_cache = {}
 
 def gauss_lobatto_points(n_points, domain=(-1, 1)):
     """
-    Compute Gauss-Lobatto quadrature points on a given domain.
+    Compute Gauss-Lobatto quadrature points on a given domain with caching.
     
     Gauss-Lobatto points include the endpoints and are optimal for polynomial interpolation.
     For n_points, we get n_points points.
@@ -329,21 +429,26 @@ def gauss_lobatto_points(n_points, domain=(-1, 1)):
     if n_points < 2:
         raise ValueError("Need at least 2 points")
     
-    if n_points == 2:
-        points = np.array([-1.0, 1.0])
+    # Check cache first
+    if n_points in _gauss_lobatto_cache:
+        points_ref = _gauss_lobatto_cache[n_points]
     else:
-        # For Gauss-Lobatto, interior points are cos(π*k/(n-1)) for k=1 to n-2
-        # where n = n_points - 1
-        n = n_points - 1
-        interior = []
-        for k in range(1, n):
-            x = np.cos(np.pi * k / n)
-            interior.append(x)
-        points = np.array([-1.0] + sorted(interior) + [1.0])
+        if n_points == 2:
+            points_ref = np.array([-1.0, 1.0])
+        else:
+            # For Gauss-Lobatto, interior points are cos(π*k/(n-1)) for k=1 to n-2
+            n = n_points - 1
+            # Vectorized computation instead of loop
+            k = np.arange(1, n)
+            interior = np.cos(np.pi * k / n)
+            points_ref = np.concatenate([[-1.0], np.sort(interior), [1.0]])
+        
+        # Cache the reference points
+        _gauss_lobatto_cache[n_points] = points_ref
     
     # Transform to the desired domain
     a, b = domain
-    transformed_points = a + (b - a) * (points + 1) / 2
+    transformed_points = a + (b - a) * (points_ref + 1) / 2
     
     return transformed_points
 
@@ -360,18 +465,19 @@ def solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma):
     from scipy.sparse import csr_matrix, bmat
     from scipy.sparse.linalg import spsolve
 
-    # Pre-compute common matrices
-    ATA = A.T @ A  # Dense but often small
-    ATb = A.T @ b_pde
+    # Pre-compute common matrices - use optimized dot products
+    ATA = np.dot(A.T, A)  # Use dot for better performance than @
+    ATb = np.dot(A.T, b_pde)
 
-    # Main block: I + gamma*A^T*A
-    main_block = np.eye(M) + gamma * ATA
+    # Main block: I + gamma*A^T*A (pre-compute and reuse)
+    main_block = np.eye(M, dtype=np.float64)
+    main_block += gamma * ATA  # In-place addition
 
-    # Create sparse blocks
-    H_sparse = csr_matrix(main_block)  # Main block (potentially dense)
-    CT_sparse = csr_matrix(C.T)        # Constraint transpose
-    C_sparse = csr_matrix(C)           # Constraint matrix
-    zero_block = csr_matrix((2, 2))    # Zero block
+    # Create sparse blocks - directly specify dtype for efficiency
+    H_sparse = csr_matrix(main_block, dtype=np.float64)
+    CT_sparse = csr_matrix(C.T, dtype=np.float64)
+    C_sparse = csr_matrix(C, dtype=np.float64)
+    zero_block = csr_matrix((2, 2), dtype=np.float64)
 
     # Build sparse KKT matrix using block structure
     kkt_matrix_sparse = bmat([
@@ -379,8 +485,10 @@ def solve_lssvr_system_sparse(A, C, b_pde, b_bc, M, gamma):
         [C_sparse, zero_block]
     ], format='csr')
 
-    # Build RHS vector
-    kkt_rhs = np.concatenate([gamma * ATb, b_bc])
+    # Build RHS vector - pre-allocate
+    kkt_rhs = np.empty(M + 2, dtype=np.float64)
+    kkt_rhs[:M] = gamma * ATb
+    kkt_rhs[M:M+2] = b_bc
 
     try:
         # Try sparse direct solver first
@@ -1193,11 +1301,13 @@ class FEMLSSVRPrimalSolver:
         # SIMD batch processing parameters - optimized for modern CPUs
         # Dynamic batch sizing: larger batches for more elements, smaller for fewer
         if n_elements <= 8:
-            batch_size = 2  # Small batches for small problems
+            batch_size = 4  # Small batches for small problems (increased from 2)
         elif n_elements <= 32:
-            batch_size = 4  # Medium batches for medium problems
+            batch_size = 8  # Medium batches for medium problems (increased from 4)
+        elif n_elements <= 128:
+            batch_size = 16  # Large batches for big problems
         else:
-            batch_size = 8  # Large batches for big problems (SIMD optimal)
+            batch_size = 32  # Very large batches for massive problems
         
         for batch_start in range(0, n_elements, batch_size):
             batch_end = min(batch_start + batch_size, n_elements)
@@ -1417,7 +1527,8 @@ if __name__ == "__main__":
     test_points = np.linspace(-1, 1, 201)
     
     # Solve using hybrid method with primal LSSVR
-    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, global_domain=(-1, 1), solution_order=args.solution_order)
+    solver = FEMLSSVRPrimalSolver(num_nodes, lssvr_M=args.M, lssvr_gamma=args.gamma, 
+                                   global_domain=(-1, 1), solution_order=args.solution_order)
     solver.solve()
     
     # Evaluate solution
