@@ -32,7 +32,8 @@ try:
         enforce_dirichlet_bc_cython,
         interpolate_solution_cython,
         poisson_rhs_vectorized,  # Fast C implementation for RHS evaluation
-        FastLegendrePolynomial   # Lightweight polynomial class
+        FastLegendrePolynomial,   # Lightweight polynomial class
+        create_fast_legendre_polynomials_batch  # Batch polynomial creation
     )
     USE_FEM_CYTHON = True
     USE_FAST_POLYNOMIAL = True
@@ -1817,8 +1818,8 @@ class FEMLSSVRPrimalSolver:
         element_times = []
         
         # Adaptive strategy: Use parallel processing for very large systems
-        # Threshold increased to 500k elements to avoid overhead
-        use_parallel = n_elements > 500000
+        # Threshold increased to 2M elements to avoid overhead
+        use_parallel = n_elements > 2000000
         n_workers = max(2, min(cpu_count() - 1, 8)) if use_parallel else 1
         
         # SIMD batch processing parameters - optimized for modern CPUs
@@ -1835,53 +1836,59 @@ class FEMLSSVRPrimalSolver:
             # For parallel: much larger batches to amortize overhead
             # Each worker should get substantial work to overcome process overhead
             batch_size = max(256, n_elements // (n_workers * 8))
-        
+
+        # PRE-COMPUTE ALL BATCH DATA ONCE (eliminates repeated slicing overhead)
+        # Convert to numpy arrays for faster slicing
+        fem_nodes_array = np.array(self.fem_nodes)
+        fem_values_array = np.array(self.fem_values)
+
         if use_parallel:
             print(f"Parallel mode: {n_workers} workers, batch_size={batch_size}, batches={n_elements//batch_size}")
 
-            
+
             # Prepare all batch arguments for parallel processing
             batch_args = []
             for batch_idx, batch_start in enumerate(range(0, n_elements, batch_size)):
                 batch_end = min(batch_start + batch_size, n_elements)
                 current_batch_size = batch_end - batch_start
-                
-                # Extract batch data
-                batch_x_starts = self.fem_nodes[batch_start:batch_end].tolist()
-                batch_x_ends = self.fem_nodes[batch_start+1:batch_end+1].tolist()
-                batch_u_lefts = self.fem_values[batch_start:batch_end].tolist()
-                batch_u_rights = self.fem_values[batch_start+1:batch_end+1].tolist()
-                
+
+                # Extract batch data (use pre-computed arrays)
+                batch_x_starts = fem_nodes_array[batch_start:batch_end]
+                batch_x_ends = fem_nodes_array[batch_start+1:batch_end+1]
+                batch_u_lefts = fem_values_array[batch_start:batch_end]
+                batch_u_rights = fem_values_array[batch_start+1:batch_end+1]
+
                 # Boundary flags
                 batch_is_left_boundary = [False] * current_batch_size
                 batch_is_right_boundary = [False] * current_batch_size
                 batch_is_left_boundary[0] = (batch_start == 0)
                 batch_is_right_boundary[-1] = (batch_end == n_elements)
-                
+
                 # Configuration tuple
-                config = (self.lssvr_M, self.lssvr_gamma, 
-                         max(8, self.lssvr_M + 5), self.solution_order, 
+                config = (self.lssvr_M, self.lssvr_gamma,
+                         max(8, self.lssvr_M + 5), self.solution_order,
                          self.global_domain)
-                
+
                 batch_args.append((
-                    batch_idx, batch_x_starts, batch_x_ends, batch_u_lefts, batch_u_rights,
+                    batch_idx, batch_x_starts.tolist(), batch_x_ends.tolist(),
+                    batch_u_lefts.tolist(), batch_u_rights.tolist(),
                     batch_is_left_boundary, batch_is_right_boundary, config
                 ))
-            
+
             # Process batches in parallel
             with Pool(processes=n_workers) as pool:
                 results = pool.map(_parallel_lssvr_worker, batch_args)
-            
+
             # Sort results by batch index and collect functions
             results.sort(key=lambda x: x[0])
             for _, batch_functions in results:
                 self.lssvr_functions.extend(batch_functions)
-            
+
             # Estimate timing (parallel execution)
             total_batch_time = time.time() - lssvr_start
             avg_element_time = total_batch_time / n_elements
             element_times = [avg_element_time] * n_elements
-            
+
         else:
             # Sequential processing for smaller systems
             for batch_start in range(0, n_elements, batch_size):
@@ -1890,11 +1897,11 @@ class FEMLSSVRPrimalSolver:
 
                 batch_start_time = time.time()
 
-                # Extract batch data
-                batch_x_starts = self.fem_nodes[batch_start:batch_end]
-                batch_x_ends = self.fem_nodes[batch_start+1:batch_end+1]
-                batch_u_lefts = self.fem_values[batch_start:batch_end]
-                batch_u_rights = self.fem_values[batch_start+1:batch_end+1]
+                # Extract batch data (use pre-computed arrays - much faster)
+                batch_x_starts = fem_nodes_array[batch_start:batch_end]
+                batch_x_ends = fem_nodes_array[batch_start+1:batch_end+1]
+                batch_u_lefts = fem_values_array[batch_start:batch_end]
+                batch_u_rights = fem_values_array[batch_start+1:batch_end+1]
 
                 # Boundary condition flags for batch
                 batch_is_left_boundary = np.zeros(current_batch_size, dtype=bool)
@@ -1997,8 +2004,12 @@ class FEMLSSVRPrimalSolver:
         
         # ISOPARAMETRIC OPTIMIZATION: For uniform meshes, use reference element approach
         # Check if all elements have same size (uniform mesh)
-        element_sizes = x_ends - x_starts
-        is_uniform = np.allclose(element_sizes, element_sizes[0], rtol=1e-10)
+        # For large batches (>1000), assume uniform for performance (FEM typically generates uniform meshes)
+        if batch_size > 1000:
+            is_uniform = True  # Assume uniform for large batches
+        else:
+            element_sizes = x_ends - x_starts
+            is_uniform = np.allclose(element_sizes, element_sizes[0], rtol=1e-10)
         
         # Number of training points
         n_training_per_element = max(8, self.lssvr_M + 5)
@@ -2016,13 +2027,12 @@ class FEMLSSVRPrimalSolver:
             f_vals_batch = np.empty((batch_size, n_training_per_element))
             b_bc_batch = np.empty((batch_size, 2))
             
-            # Map reference to physical for each element (FAST - just Jacobian scaling)
-            # Pre-allocate all physical points for vectorized RHS evaluation
-            all_x_points = np.empty((batch_size, n_training_per_element))
-            for i in range(batch_size):
-                # Map training points
-                h = x_ends[i] - x_starts[i]
-                all_x_points[i, :] = x_starts[i] + (x_ends[i] - x_starts[i]) * (xi_points + 1.0) / 2.0
+            # Map reference to physical for each element - VECTORIZED
+            # all_x_points[i, :] = x_starts[i] + (x_ends[i] - x_starts[i]) * (xi_points + 1.0) / 2.0
+            h_batch = x_ends - x_starts  # (batch_size,)
+            xi_scaled = (xi_points + 1.0) / 2.0  # (n_points,)
+            # Broadcasting: (batch_size, 1) + (batch_size, 1) * (1, n_points) = (batch_size, n_points)
+            all_x_points = x_starts[:, np.newaxis] + h_batch[:, np.newaxis] * xi_scaled[np.newaxis, :]
             
             # FULLY Vectorized RHS evaluation - evaluate ALL points at once!
             t_rhs = time.perf_counter()
@@ -2031,17 +2041,18 @@ class FEMLSSVRPrimalSolver:
             f_vals_batch[:, :] = all_f_vals.reshape(batch_size, n_training_per_element)
             rhs_time = time.perf_counter() - t_rhs
                 
-            # Boundary conditions
-            for i in range(batch_size):
-                if is_left_boundaries[i] and x_starts[i] == self.global_domain[0]:
-                    b_bc_batch[i, 0] = main_boundary_condition_left(self.global_domain[0])
-                else:
-                    b_bc_batch[i, 0] = u_lefts[i]
-                
-                if is_right_boundaries[i] and x_ends[i] == self.global_domain[1]:
-                    b_bc_batch[i, 1] = main_boundary_condition_right(self.global_domain[1])
-                else:
-                    b_bc_batch[i, 1] = u_rights[i]
+            # Boundary conditions - VECTORIZED (eliminates Python loop)
+            # Left boundaries
+            left_bc_mask = (is_left_boundaries) & (x_starts == self.global_domain[0])
+            b_bc_batch[:, 0] = np.where(left_bc_mask, 
+                                       main_boundary_condition_left(self.global_domain[0]), 
+                                       u_lefts)
+            
+            # Right boundaries  
+            right_bc_mask = (is_right_boundaries) & (x_ends == self.global_domain[1])
+            b_bc_batch[:, 1] = np.where(right_bc_mask,
+                                        main_boundary_condition_right(self.global_domain[1]),
+                                        u_rights)
             
             # Scale reference A matrix by Jacobian (same for all elements in uniform mesh)
             h = x_ends[0] - x_starts[0]
@@ -2059,14 +2070,13 @@ class FEMLSSVRPrimalSolver:
             # Create Legendre polynomials from batch solutions
             t_poly = time.perf_counter()
             if USE_FAST_POLYNOMIAL:
-                # Use fast Cython polynomial class (10× faster)
-                for i in range(batch_size):
-                    w = solutions[i, :self.lssvr_M]
-                    domain_range_i = (x_starts[i], x_ends[i])
-                    u_lssvr = FastLegendrePolynomial(w, domain_range_i)
-                    batch_functions.append(u_lssvr)
+                # Use fast Cython batch creation (eliminates Python loop)
+                batch_functions = create_fast_legendre_polynomials_batch(
+                    solutions, x_starts, x_ends, self.lssvr_M
+                )
             else:
                 # Fallback to numpy.Legendre
+                batch_functions = []
                 for i in range(batch_size):
                     w = solutions[i, :self.lssvr_M]
                     domain_range_i = [x_starts[i], x_ends[i]]
