@@ -259,6 +259,9 @@ _legendre_cache = {}
 _cache_hits = 0
 _cache_misses = 0
 
+# Isoparametric reference element cache (computed ONCE for all elements)
+_reference_matrices_cache = {}
+
 # Try to use Cython-optimized functions
 USE_CYTHON = False
 
@@ -268,6 +271,146 @@ try:
     print("Cython extension available and enabled for performance")
 except ImportError:
     print("Cython extension not available, using standard NumPy operations")
+
+def build_reference_legendre_matrices(M, n_training_points):
+    """
+    Build REFERENCE Legendre matrices on standard domain [-1, 1].
+    These are computed ONCE and reused for ALL elements via isoparametric mapping.
+    
+    This is analogous to FEM reference elements: compute shape functions once,
+    then map to physical elements using Jacobian transformation.
+    
+    Args:
+        M: Number of Legendre basis functions
+        n_training_points: Number of collocation points
+    
+    Returns:
+        A_ref: Reference A matrix (n_training_points × M) - second derivatives
+        C_ref: Reference C matrix (2 × M) - boundary values at ξ = ±1
+        xi_points: Training points in reference domain [-1, 1]
+    """
+    cache_key = (M, n_training_points)
+    
+    if cache_key in _reference_matrices_cache:
+        return _reference_matrices_cache[cache_key]
+    
+    # Training points in reference domain [-1, 1]
+    xi_points = gauss_lobatto_points(n_training_points, domain=(-1, 1))
+    
+    A_ref = np.zeros((n_training_points, M), dtype=np.float64)
+    C_ref = np.zeros((2, M), dtype=np.float64)
+    
+    # Use Cython if available
+    if USE_CYTHON and M <= 13:
+        # Cython functions work directly on [-1, 1] domain with scale=1
+        A_ref = compute_legendre_A_matrix(xi_points, M, deriv_scale=1.0)
+        C_ref = compute_legendre_C_matrix(-1.0, 1.0, M)
+    else:
+        # Build A matrix (second derivatives on reference element)
+        for i in range(M):
+            if i == 0:
+                A_ref[:, 0] = 0.0  # P_0'' = 0
+            elif i == 1:
+                A_ref[:, 1] = 0.0  # P_1'' = 0
+            elif i == 2:
+                A_ref[:, 2] = -3.0  # P_2''(ξ) = 3
+            elif i == 3:
+                A_ref[:, 3] = -15.0 * xi_points  # P_3''(ξ) = 15ξ
+            elif i == 4:
+                xi2 = xi_points * xi_points
+                A_ref[:, 4] = (-52.5 * xi2 + 7.5)  # P_4''(ξ) = 52.5ξ² - 7.5
+            elif i == 5:
+                xi2 = xi_points * xi_points
+                xi3 = xi2 * xi_points
+                A_ref[:, 5] = (-157.5 * xi3 + 52.5 * xi_points)  # P_5''(ξ)
+            else:
+                # Higher order: use numpy Legendre
+                coeffs = np.zeros(M)
+                coeffs[i] = 1.0
+                u = Legendre(coeffs, domain=(-1, 1))
+                u_deriv2 = u.deriv(2)
+                A_ref[:, i] = -u_deriv2(xi_points)
+        
+        # Build C matrix (boundary values at ξ = -1, +1)
+        for i in range(M):
+            C_ref[0, i] = eval_legendre(i, -1.0)  # Left boundary
+            C_ref[1, i] = eval_legendre(i, +1.0)  # Right boundary
+    
+    # Cache for reuse
+    _reference_matrices_cache[cache_key] = (A_ref, C_ref, xi_points)
+    
+    return A_ref, C_ref, xi_points
+
+def map_reference_to_physical(A_ref, C_ref, xi_points, x_left, x_right):
+    """
+    Map reference element matrices to physical element using isoparametric transformation.
+    
+    Transformation: x = x_left + (x_right - x_left) * (ξ + 1) / 2
+    where ξ ∈ [-1, 1] and x ∈ [x_left, x_right]
+    
+    Jacobian: dx/dξ = (x_right - x_left) / 2 = h/2
+    
+    For second derivatives:
+        d²u/dx² = (dξ/dx)² * d²u/dξ² = (2/h)² * d²u/dξ²
+    
+    Args:
+        A_ref: Reference A matrix (second derivatives)
+        C_ref: Reference C matrix (boundary values) - unchanged!
+        xi_points: Reference training points
+        x_left, x_right: Physical element boundaries
+    
+    Returns:
+        A_phys: Physical A matrix (scaled by Jacobian)
+        C_phys: Physical C matrix (same as reference - Legendre values don't change!)
+        x_points: Physical training points
+    """
+    h = x_right - x_left  # Element length
+    jacobian = h / 2.0    # dx/dξ
+    
+    # Inverse Jacobian for second derivatives: (dξ/dx)² = (2/h)²
+    inv_jac_sq = (2.0 / h) ** 2
+    
+    # Scale A matrix by inverse Jacobian squared
+    A_phys = A_ref * inv_jac_sq
+    
+    # C matrix is UNCHANGED - Legendre polynomial values at boundaries don't change
+    # because we're still evaluating at ξ = ±1, just interpreting as physical boundaries
+    C_phys = C_ref  # No copy needed - same values!
+    
+    # Map training points to physical domain
+    x_points = x_left + (x_right - x_left) * (xi_points + 1.0) / 2.0
+    
+    return A_phys, C_phys, x_points
+
+def build_legendre_matrices_isoparametric(M, x_left, x_right, n_training_points=None):
+    """
+    Build Legendre matrices using isoparametric transformation (FEM-style).
+    
+    This is MUCH faster than build_legendre_matrices_jit because:
+    1. Reference matrices computed ONCE (cached)
+    2. Only Jacobian scaling per element (trivial operation)
+    3. No repeated Legendre polynomial evaluations
+    
+    Args:
+        M: Number of Legendre basis functions
+        x_left, x_right: Physical element boundaries
+        n_training_points: Number of training points (default: max(8, M+5))
+    
+    Returns:
+        A: Physical A matrix (n_points × M)
+        C: Physical C matrix (2 × M)
+        x_points: Physical training points
+    """
+    if n_training_points is None:
+        n_training_points = max(8, M + 5)
+    
+    # Get reference matrices (cached after first call)
+    A_ref, C_ref, xi_points = build_reference_legendre_matrices(M, n_training_points)
+    
+    # Map to physical element (just Jacobian scaling - very fast!)
+    A_phys, C_phys, x_points = map_reference_to_physical(A_ref, C_ref, xi_points, x_left, x_right)
+    
+    return A_phys, C_phys, x_points
 
 def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
     """
@@ -1512,59 +1655,52 @@ class FEMLSSVRPrimalSolver:
         
         batch_functions = []
         
-        # SIMD-optimized batch processing: vectorize training points and RHS computation
-        # Generate training points for all elements in batch simultaneously
-        n_training_per_element = max(8, self.lssvr_M + 5)  # Use at least M+5 training points
-        training_points_batch = np.zeros((batch_size, n_training_per_element))
-        for i in range(batch_size):
-            points = gauss_lobatto_points(n_training_per_element, domain=(x_starts[i], x_ends[i]))
-            training_points_batch[i, :] = points
-        
-        # Vectorized RHS computation across all elements
-        f_vals_batch = np.zeros((batch_size, n_training_per_element))
-        for i in range(batch_size):
-            f_vals_batch[i, :] = poisson_rhs(training_points_batch[i, :], self.solution_order)
-        
-        # Vectorized boundary condition computation
-        b_bc_batch = np.zeros((batch_size, 2))
-        for i in range(batch_size):
-            # Left boundary condition
-            if is_left_boundaries[i] and x_starts[i] == self.global_domain[0]:
-                b_bc_batch[i, 0] = main_boundary_condition_left(self.global_domain[0])
-            else:
-                b_bc_batch[i, 0] = u_lefts[i]
-            
-            # Right boundary condition
-            if is_right_boundaries[i] and x_ends[i] == self.global_domain[1]:
-                b_bc_batch[i, 1] = main_boundary_condition_right(self.global_domain[1])
-            else:
-                b_bc_batch[i, 1] = u_rights[i]
-        
-        # KEY OPTIMIZATION: For uniform meshes, all elements have SAME A, C matrices!
+        # ISOPARAMETRIC OPTIMIZATION: For uniform meshes, use reference element approach
         # Check if all elements have same size (uniform mesh)
         element_sizes = x_ends - x_starts
         is_uniform = np.allclose(element_sizes, element_sizes[0], rtol=1e-10)
         
+        # Number of training points
+        n_training_per_element = max(8, self.lssvr_M + 5)
+        
         if is_uniform:
-            # FAST PATH: Build matrices ONCE, solve batch simultaneously
-            domain_range = [x_starts[0], x_ends[0]]
+            # ISOPARAMETRIC PATH: Use reference element (FEM-style)
+            # Compute reference matrices ONCE, then just scale by Jacobian for each element
             
-            # Build constraint matrices ONCE for entire batch
-            if USE_CYTHON and self.lssvr_M <= 13:
-                A, C = build_legendre_matrices_cython(
-                    self.lssvr_M, training_points_batch[0, :], 
-                    x_starts[0], x_ends[0], domain_range
-                )
-            elif USE_VECTORIZED:
-                A, C = build_legendre_matrices_vectorized(
-                    self.lssvr_M, training_points_batch[0, :], 
-                    x_starts[0], x_ends[0], domain_range
-                )
-            else:
-                A, C = build_legendre_matrices_jit(
-                    self.lssvr_M, training_points_batch[0, :], 
-                    x_starts[0], x_ends[0], domain_range
-                )
+            # Build reference matrices (cached after first call)
+            A_ref, C_ref, xi_points = build_reference_legendre_matrices(
+                self.lssvr_M, n_training_per_element
+            )
+            
+            # Pre-allocate arrays for batch
+            f_vals_batch = np.zeros((batch_size, n_training_per_element))
+            b_bc_batch = np.zeros((batch_size, 2))
+            
+            # Map reference to physical for each element (FAST - just Jacobian scaling)
+            for i in range(batch_size):
+                # Map training points and get scaled A matrix
+                h = x_ends[i] - x_starts[i]
+                x_points_phys = x_starts[i] + (x_ends[i] - x_starts[i]) * (xi_points + 1.0) / 2.0
+                
+                # Compute RHS at physical training points
+                f_vals_batch[i, :] = poisson_rhs(x_points_phys, self.solution_order)
+                
+                # Boundary conditions
+                if is_left_boundaries[i] and x_starts[i] == self.global_domain[0]:
+                    b_bc_batch[i, 0] = main_boundary_condition_left(self.global_domain[0])
+                else:
+                    b_bc_batch[i, 0] = u_lefts[i]
+                
+                if is_right_boundaries[i] and x_ends[i] == self.global_domain[1]:
+                    b_bc_batch[i, 1] = main_boundary_condition_right(self.global_domain[1])
+                else:
+                    b_bc_batch[i, 1] = u_rights[i]
+            
+            # Scale reference A matrix by Jacobian (same for all elements in uniform mesh)
+            h = x_ends[0] - x_starts[0]
+            inv_jac_sq = (2.0 / h) ** 2
+            A = A_ref * inv_jac_sq
+            C = C_ref  # Unchanged for Legendre polynomials
             
             # Solve entire batch with one factorization
             solutions, method_used = solve_lssvr_batch_optimized(
@@ -1579,46 +1715,54 @@ class FEMLSSVRPrimalSolver:
                 batch_functions.append(u_lssvr)
                 
         else:
-            # SLOW PATH: Non-uniform mesh, solve each element individually
+            # NON-UNIFORM PATH: Different element sizes require individual treatment
+            # Still use isoparametric approach but with per-element Jacobians
+            
+            # Pre-allocate
+            training_points_batch = np.zeros((batch_size, n_training_per_element))
+            f_vals_batch = np.zeros((batch_size, n_training_per_element))
+            b_bc_batch = np.zeros((batch_size, 2))
+            
+            # Get reference matrices (cached)
+            A_ref, C_ref, xi_points = build_reference_legendre_matrices(
+                self.lssvr_M, n_training_per_element
+            )
+            
             for i in range(batch_size):
-                domain_range = [x_starts[i], x_ends[i]]
+                # Map to physical element
+                h = x_ends[i] - x_starts[i]
+                x_points_phys = x_starts[i] + h * (xi_points + 1.0) / 2.0
+                training_points_batch[i, :] = x_points_phys
                 
-                # Build constraint matrices using optimized operations
-                if USE_CYTHON and self.lssvr_M <= 13:
-                    A, C = build_legendre_matrices_cython(
-                        self.lssvr_M, training_points_batch[i, :], 
-                        x_starts[i], x_ends[i], domain_range
-                    )
-                elif USE_VECTORIZED:
-                    A, C = build_legendre_matrices_vectorized(
-                        self.lssvr_M, training_points_batch[i, :], 
-                        x_starts[i], x_ends[i], domain_range
-                    )
+                # RHS
+                f_vals_batch[i, :] = poisson_rhs(x_points_phys, self.solution_order)
+                
+                # Boundary conditions
+                if is_left_boundaries[i] and x_starts[i] == self.global_domain[0]:
+                    b_bc_batch[i, 0] = main_boundary_condition_left(self.global_domain[0])
                 else:
-                    A, C = build_legendre_matrices_jit(
-                        self.lssvr_M, training_points_batch[i, :], 
-                        x_starts[i], x_ends[i], domain_range
-                    )
+                    b_bc_batch[i, 0] = u_lefts[i]
                 
-                # Solve KKT system for this element
-                try:
-                    solution, method_used = solve_lssvr_system(
-                        A, C, f_vals_batch[i, :], b_bc_batch[i, :], 
-                        self.lssvr_M, self.lssvr_gamma
-                    )
-                    
-                    w = solution[:self.lssvr_M]
-                    
-                    # Create Legendre polynomial approximation
-                    u_lssvr = Legendre(w, domain_range)
-                    batch_functions.append(u_lssvr)
-                    
-                except Exception as e:
-                    print(f"Batch element {i} failed: {e}")
-                    # Fallback to linear interpolation
-                    def linear_fallback(x):
-                        return u_lefts[i] + (u_rights[i] - u_lefts[i]) * (x - x_starts[i]) / (x_ends[i] - x_starts[i])
-                    batch_functions.append(linear_fallback)
+                if is_right_boundaries[i] and x_ends[i] == self.global_domain[1]:
+                    b_bc_batch[i, 1] = main_boundary_condition_right(self.global_domain[1])
+                else:
+                    b_bc_batch[i, 1] = u_rights[i]
+                
+                # Scale A matrix by element-specific Jacobian
+                inv_jac_sq = (2.0 / h) ** 2
+                A = A_ref * inv_jac_sq
+                C = C_ref
+                
+                # Solve this element
+                solution, method_used = solve_lssvr_system(
+                    A, C, f_vals_batch[i, :], b_bc_batch[i, :], 
+                    self.lssvr_M, self.lssvr_gamma
+                )
+                
+                w = solution[:self.lssvr_M]
+                domain_range_i = [x_starts[i], x_ends[i]]
+                u_lssvr = Legendre(w, domain_range_i)
+                batch_functions.append(u_lssvr)
         
         return batch_functions
     
