@@ -1863,8 +1863,8 @@ class FEMLSSVRPrimalSolver:
         element_times = []
         
         # Adaptive strategy: Use parallel processing for very large systems
-        # Threshold increased to 10M elements to avoid overhead
-        use_parallel = n_elements > 10000000
+        # Threshold set to 5M elements to enable parallel processing for 10M+ problems
+        use_parallel = n_elements > 5000000
         n_workers = max(2, min(cpu_count() - 1, 8)) if use_parallel else 1
         
         # SIMD batch processing parameters - optimized for modern CPUs
