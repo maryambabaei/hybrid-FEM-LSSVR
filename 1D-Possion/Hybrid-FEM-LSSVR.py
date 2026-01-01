@@ -258,60 +258,15 @@ _legendre_cache = {}
 _cache_hits = 0
 _cache_misses = 0
 
-# Try to use Numba for JIT compilation of critical functions
+# Try to use Cython-optimized functions
+USE_CYTHON = False
+
 try:
-    from numba import jit
-    USE_NUMBA = True
-    
-    @jit(nopython=True, cache=True)
-    def _compute_legendre_A_matrix_numba(x_scaled, M, deriv_scale):
-        """Numba-optimized A matrix computation."""
-        n_points = len(x_scaled)
-        A = np.zeros((n_points, M), dtype=np.float64)
-        
-        # Vectorized operations for first 6 polynomials
-        if M > 2:
-            A[:, 2] = -3.0 * deriv_scale
-        if M > 3:
-            A[:, 3] = -15.0 * x_scaled * deriv_scale
-        if M > 4:
-            x2 = x_scaled * x_scaled
-            A[:, 4] = (-52.5 * x2 + 7.5) * deriv_scale
-        if M > 5:
-            x3 = x_scaled * x_scaled * x_scaled
-            A[:, 5] = (-157.5 * x3 + 52.5 * x_scaled) * deriv_scale
-        
-        return A
-    
-    @jit(nopython=True, cache=True)
-    def _compute_legendre_C_matrix_numba(xmin_scaled, xmax_scaled, M):
-        """Numba-optimized C matrix computation."""
-        C = np.zeros((2, M), dtype=np.float64)
-        
-        # P_0(x) = 1
-        C[0, 0] = 1.0
-        C[1, 0] = 1.0
-        
-        if M > 1:
-            # P_1(x) = x
-            C[0, 1] = xmin_scaled
-            C[1, 1] = xmax_scaled
-        
-        if M > 2:
-            # P_2(x) = (3x²-1)/2
-            C[0, 2] = 0.5 * (3 * xmin_scaled**2 - 1)
-            C[1, 2] = 0.5 * (3 * xmax_scaled**2 - 1)
-        
-        if M > 3:
-            # P_3(x) = (5x³-3x)/2
-            C[0, 3] = 0.5 * (5 * xmin_scaled**3 - 3 * xmin_scaled)
-            C[1, 3] = 0.5 * (5 * xmax_scaled**3 - 3 * xmax_scaled)
-        
-        return C
-    
+    from lssvr_kernels import compute_legendre_A_matrix, compute_legendre_C_matrix
+    USE_CYTHON = True
+    print("Cython extension available and enabled for performance")
 except ImportError:
-    USE_NUMBA = False
-    print("Numba not available, using standard NumPy operations")
+    print("Cython extension not available, using standard NumPy operations")
 
 def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
     """
@@ -353,10 +308,10 @@ def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
     A = np.zeros((n_points, M), dtype=np.float64)
     C = np.zeros((2, M), dtype=np.float64)
 
-    # Use Numba-optimized version if available and M <= 6
-    if USE_NUMBA and M <= 6:
-        A = _compute_legendre_A_matrix_numba(x_scaled, M, deriv_scale)
-        C = _compute_legendre_C_matrix_numba(xmin_scaled, xmax_scaled, M)
+    # Use Cython-optimized version if available (supports up to M=13)
+    if USE_CYTHON and M <= 13:
+        A = compute_legendre_A_matrix(x_scaled, M, deriv_scale)
+        C = compute_legendre_C_matrix(xmin_scaled, xmax_scaled, M)
     else:
         # Build A matrix (second derivatives) - vectorized where possible
         for i in range(M):
