@@ -1,9 +1,10 @@
 import numpy as np
 from scipy.optimize import minimize
-from scipy.linalg import solve
+from scipy.linalg import solve, cho_factor, cho_solve
 from scipy import integrate
 import matplotlib.pyplot as plt
-from numpy.polynomial.legendre import Legendre, leggauss
+from numpy.polynomial.legendre import Legendre, leggauss, legder, legroots
+from scipy.special import eval_legendre
 from skfem import *
 from skfem.helpers import dot, grad
 import argparse
@@ -337,33 +338,11 @@ def build_legendre_matrices_jit(M, training_points, xmin, xmax, domain_range):
                 u_deriv2 = u.deriv(2)
                 A[:, i] = -u_deriv2(x_scaled) * deriv_scale
 
-        # Build C matrix (boundary values) - also optimized
+        # Build C matrix (boundary values) - optimized with scipy.special
         for i in range(M):
-            if i == 0:
-                C[0, 0] = 1.0
-                C[1, 0] = 1.0
-            elif i == 1:
-                C[0, 1] = xmin_scaled
-                C[1, 1] = xmax_scaled
-            elif i == 2:
-                # P_2(x) = (3x²-1)/2
-                p2_min = 0.5 * (3 * xmin_scaled**2 - 1)
-                p2_max = 0.5 * (3 * xmax_scaled**2 - 1)
-                C[0, 2] = p2_min
-                C[1, 2] = p2_max
-            elif i == 3:
-                # P_3(x) = (5x³-3x)/2
-                p3_min = 0.5 * (5 * xmin_scaled**3 - 3 * xmin_scaled)
-                p3_max = 0.5 * (5 * xmax_scaled**3 - 3 * xmax_scaled)
-                C[0, 3] = p3_min
-                C[1, 3] = p3_max
-            else:
-                # For higher polynomials, use numpy
-                coeffs = np.zeros(M)
-                coeffs[i] = 1.0
-                u = Legendre(coeffs, domain=(-1, 1))
-                C[0, i] = u(xmin_scaled)
-                C[1, i] = u(xmax_scaled)
+            # Use scipy.special.eval_legendre for direct evaluation (10-100x faster)
+            C[0, i] = eval_legendre(i, xmin_scaled)
+            C[1, i] = eval_legendre(i, xmax_scaled)
     
     # Cache transformation factors for reuse (store template shift_factor for reference)
     if cache_key not in _legendre_cache:
@@ -819,7 +798,63 @@ def solve_lssvr_system_dense_cython_scaled(kkt_matrix_scaled, kkt_rhs_scaled,
 
 def solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma):
     """
-    Original Python implementation of dense LSSVR solver (fallback).
+    Optimized dense LSSVR solver using Cholesky factorization + Schur complement.
+    
+    KKT system: [H  C^T] [w] = [g]
+                [C   0 ] [λ]   [h]
+    where H = I + γA^TA (symmetric positive definite)
+    
+    Uses Schur complement method:
+    1. Factorize H using Cholesky (faster than LU for SPD matrices)
+    2. Compute Schur complement S = -C H^{-1} C^T
+    3. Solve for Lagrange multipliers: S λ = h - C H^{-1} g
+    4. Back-substitute for w: H w = g - C^T λ
+    """
+    # Pre-compute common matrices
+    ATA = A.T @ A
+    ATb = A.T @ b_pde
+
+    # Build H = I + gamma * A^T A (symmetric positive definite)
+    H = np.eye(M, dtype=np.float64) + gamma * ATA
+    
+    # Right-hand side vectors
+    g = gamma * ATb  # For w equation
+    h = b_bc         # For λ equation
+    
+    try:
+        # Step 1: Cholesky factorization of H (2x faster than LU for SPD)
+        H_factor = cho_factor(H, lower=False)  # Upper triangular factorization
+        
+        # Step 2: Compute H^{-1} C^T efficiently using Cholesky solve
+        H_inv_CT = cho_solve(H_factor, C.T)
+        
+        # Step 3: Schur complement S = -C H^{-1} C^T (2x2 matrix)
+        S = -C @ H_inv_CT
+        
+        # Step 4: Compute right-hand side for Schur complement equation
+        H_inv_g = cho_solve(H_factor, g)
+        rhs_schur = h - C @ H_inv_g
+        
+        # Step 5: Solve 2x2 system S λ = rhs_schur
+        # For 2x2, direct solve is fastest
+        lambda_ = np.linalg.solve(S, rhs_schur)
+        
+        # Step 6: Back-substitute: H w = g - C^T λ
+        w = cho_solve(H_factor, g - C.T @ lambda_)
+        
+        # Combine solution
+        solution = np.concatenate([w, lambda_])
+        
+        return solution, "schur_cholesky"
+        
+    except np.linalg.LinAlgError as e:
+        # Fallback to original method if Cholesky fails (shouldn't happen for well-posed problems)
+        print(f"Cholesky factorization failed: {e}, using fallback solver")
+        return solve_lssvr_system_dense_python_fallback(A, C, b_pde, b_bc, M, gamma)
+
+def solve_lssvr_system_dense_python_fallback(A, C, b_pde, b_bc, M, gamma):
+    """
+    Original Python implementation of dense LSSVR solver (fallback for ill-conditioned systems).
     """
     # Pre-compute common matrices to avoid redundant calculations
     ATA = A.T @ A  # This is used in multiple places

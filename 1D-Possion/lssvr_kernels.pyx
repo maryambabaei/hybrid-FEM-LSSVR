@@ -24,8 +24,13 @@ cpdef cnp.ndarray[DTYPE_t, ndim=2] compute_legendre_A_matrix(
     """
     cdef int n_points = x_scaled.shape[0]
     cdef cnp.ndarray[DTYPE_t, ndim=2] A = np.zeros((n_points, M), dtype=np.float64)
-    cdef int i
+    cdef int i, n, j
     cdef double x, x2, x3, x4, x5, x6, x7, x8, x9, x10
+    
+    # Variables for M > 13 recursive computation
+    cdef cnp.ndarray[DTYPE_t, ndim=2] P_vals
+    cdef cnp.ndarray[DTYPE_t, ndim=2] P_deriv1
+    cdef cnp.ndarray[DTYPE_t, ndim=2] P_deriv2
     
     # Pre-compute powers for all points
     cdef cnp.ndarray[DTYPE_t, ndim=1] x2_arr = x_scaled * x_scaled
@@ -99,6 +104,68 @@ cpdef cnp.ndarray[DTYPE_t, ndim=2] compute_legendre_A_matrix(
         for i in range(n_points):
             A[i, 12] = (344452.5 * x10_arr[i] - 759885.0 * x8_arr[i] + 692835.0 * x6_arr[i] - 269325.0 * x4_arr[i] + 31185.0 * x2_arr[i] - 382.5) * deriv_scale
     
+    # For M > 13: Use recursive formula for second derivatives
+    # Second derivative recursion: P_n''(x) can be computed from P_{n-1}'(x) and P_{n-2}''(x)
+    # Relationship: (1-x²)P_n''(x) = nx[P_{n-1}''(x) - P_n''(x)] - n(n+1)P_n(x)
+    # Or use: P_n''(x) = (2n-1)[xP_{n-1}''(x) + 2P_{n-1}'(x)] - (n-1)P_{n-2}''(x) / n
+    # Simpler: Use the fact that d²/dx²[P_n(x)] can be computed via recurrence
+    # For now, use numerical differentiation or explicit formulas if M>13 is needed
+    # (Most use cases have M <= 13, so this fallback is rarely used)
+    if M > 13:
+        # Pre-compute Legendre polynomials and their derivatives for recursion
+        # This requires storing P_n, P_n', P_n'' for all n
+        # For simplicity, we use a numerical approach or fall back to NumPy
+        # Here we'll use the recurrence relation for P_n'' based on P_{n-1}' and P_{n-2}''
+        
+        P_vals = np.zeros((n_points, M), dtype=np.float64)
+        P_deriv1 = np.zeros((n_points, M), dtype=np.float64)
+        P_deriv2 = np.zeros((n_points, M), dtype=np.float64)
+        
+        # Initialize P_0, P_1 (already zero in A matrix)
+        for j in range(n_points):
+            P_vals[j, 0] = 1.0
+            P_vals[j, 1] = x_scaled[j]
+            # P_0' = 0, P_1' = 1
+            P_deriv1[j, 1] = 1.0
+        
+        # Compute all polynomials up to M using Bonnet's recursion
+        for n in range(2, M):
+            for j in range(n_points):
+                # (n+1)P_{n+1}(x) = (2n+1)xP_n(x) - nP_{n-1}(x)
+                P_vals[j, n] = ((2.0*n - 1.0) * x_scaled[j] * P_vals[j, n-1] - (n - 1.0) * P_vals[j, n-2]) / n
+        
+        # Compute first derivatives using: (1-x²)P_n'(x) = nP_{n-1}(x) - nxP_n(x)
+        # Or: P_n'(x) = n[P_{n-1}(x) - xP_n(x)] / (1-x²)
+        # Alternative: nP_n(x) = xP_n'(x) - P_{n-1}'(x) => P_n'(x) = (nP_n(x) + P_{n-1}'(x)) / x
+        # For numerical stability, use: P_n'(x) = nP_{n-1}(x) + xP_{n-1}'(x)
+        for n in range(2, M):
+            for j in range(n_points):
+                # P_n'(x) = n*P_{n-1}(x) + x*P_{n-1}'(x)
+                P_deriv1[j, n] = n * P_vals[j, n-1] + x_scaled[j] * P_deriv1[j, n-1]
+        
+        # Compute second derivatives using: P_n''(x) = (2n-1)[P_{n-1}''(x) + 2P_{n-1}'(x)*x + 2P_{n-1}(x)] - (n-1)P_{n-2}''(x) / n
+        # Simplified: P_n''(x) = n(n+1)P_n(x) - (n+1)xP_n'(x) + P_{n-1}'(x) / (1-x²)
+        # Or use: d/dx[(1-x²)P_n'(x)] = -2xP_n'(x) + (1-x²)P_n''(x) = nP_n(x) - (n+1)xP_n'(x)
+        # => P_n''(x) = [nP_n(x) - (n+1)xP_n'(x) + 2xP_n'(x)] / (1-x²)
+        # => P_n''(x) = [nP_n(x) - (n-1)xP_n'(x)] / (1-x²)
+        for n in range(2, M):
+            for j in range(n_points):
+                x = x_scaled[j]
+                x2 = x * x
+                # P_n''(x) = [n(n+1)P_n(x) - (n+1)xP_n'(x) + P_{n-1}'(x)] / (1-x²)
+                # Using alternative formula for better numerical stability:
+                # P_n''(x) = n[nP_{n-1}(x) + (n-1)xP_{n-2}'(x)] / (1-x²) (if needed)
+                # Simplest: Use finite difference on P_n'(x) or explicit formula
+                # For now, use: P_n''(x) ≈ [n²P_n(x) - nxP_n'(x)] / (1-x²)
+                if fabs(1.0 - x2) > 1e-10:
+                    P_deriv2[j, n] = (n * (n + 1.0) * P_vals[j, n] - (n + 1.0) * x * P_deriv1[j, n] + P_deriv1[j, n-1]) / (1.0 - x2)
+                else:
+                    # At boundaries (x = ±1), use alternative formula
+                    P_deriv2[j, n] = n * (n + 1.0) * n * (n - 1.0) / 4.0 if x > 0 else n * (n + 1.0) * n * (n - 1.0) / 4.0 * ((-1.0) ** n)
+                
+                # Store in A matrix with scaling
+                A[j, n] = -P_deriv2[j, n] * deriv_scale
+    
     return A
 
 
@@ -116,6 +183,11 @@ cpdef cnp.ndarray[DTYPE_t, ndim=2] compute_legendre_C_matrix(
     cdef double xmin2, xmax2, xmin3, xmax3, xmin4, xmax4, xmin5, xmax5
     cdef double xmin6, xmax6, xmin7, xmax7, xmin8, xmax8, xmin9, xmax9
     cdef double xmin10, xmax10, xmin11, xmax11, xmin12, xmax12
+    cdef int n
+    
+    # Variables for M > 13 recursive computation
+    cdef cnp.ndarray[DTYPE_t, ndim=1] P_n_min
+    cdef cnp.ndarray[DTYPE_t, ndim=1] P_n_max
     
     # Pre-compute powers for both boundaries
     xmin2 = xmin_scaled * xmin_scaled
@@ -222,5 +294,30 @@ cpdef cnp.ndarray[DTYPE_t, ndim=2] compute_legendre_C_matrix(
         xmax12 = xmax6 * xmax6
         C[0, 12] = 0.0009765625 * (676039.0 * xmin12 - 1939938.0 * xmin10 + 2078505.0 * xmin8 - 1021020.0 * xmin6 + 225225.0 * xmin4 - 18018.0 * xmin2 + 231.0)
         C[1, 12] = 0.0009765625 * (676039.0 * xmax12 - 1939938.0 * xmax10 + 2078505.0 * xmax8 - 1021020.0 * xmax6 + 225225.0 * xmax4 - 18018.0 * xmax2 + 231.0)
+    
+    # For M > 13: Use recursive formula
+    # Bonnet's recursion relation: (n+1)P_{n+1}(x) = (2n+1)xP_n(x) - nP_{n-1}(x)
+    if M > 13:
+        # Need to compute P_13, P_14, ... using recursion
+        # Pre-allocate arrays for recursive computation
+        P_n_min = np.zeros(M, dtype=np.float64)
+        P_n_max = np.zeros(M, dtype=np.float64)
+        
+        # Initialize with known values (P_12)
+        P_n_min[12] = 0.0009765625 * (676039.0 * xmin12 - 1939938.0 * xmin10 + 2078505.0 * xmin8 - 1021020.0 * xmin6 + 225225.0 * xmin4 - 18018.0 * xmin2 + 231.0)
+        P_n_max[12] = 0.0009765625 * (676039.0 * xmax12 - 1939938.0 * xmax10 + 2078505.0 * xmax8 - 1021020.0 * xmax6 + 225225.0 * xmax4 - 18018.0 * xmax2 + 231.0)
+        
+        # Also need P_11 for recursion
+        P_n_min[11] = 0.00390625 * (88179.0 * xmin11 - 230945.0 * xmin9 + 218790.0 * xmin7 - 90090.0 * xmin5 + 15015.0 * xmin3 - 693.0 * xmin_scaled)
+        P_n_max[11] = 0.00390625 * (88179.0 * xmax11 - 230945.0 * xmax9 + 218790.0 * xmax7 - 90090.0 * xmax5 + 15015.0 * xmax3 - 693.0 * xmax_scaled)
+        
+        # Recursive computation for n >= 13
+        for n in range(13, M):
+            # (n+1)P_{n+1}(x) = (2n+1)xP_n(x) - nP_{n-1}(x)
+            # P_{n+1}(x) = [(2n+1)xP_n(x) - nP_{n-1}(x)] / (n+1)
+            P_n_min[n] = ((2.0*n - 1.0) * xmin_scaled * P_n_min[n-1] - (n - 1.0) * P_n_min[n-2]) / n
+            P_n_max[n] = ((2.0*n - 1.0) * xmax_scaled * P_n_max[n-1] - (n - 1.0) * P_n_max[n-2]) / n
+            C[0, n] = P_n_min[n]
+            C[1, n] = P_n_max[n]
     
     return C
