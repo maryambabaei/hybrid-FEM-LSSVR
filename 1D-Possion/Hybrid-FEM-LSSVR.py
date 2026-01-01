@@ -796,7 +796,123 @@ def solve_lssvr_system_dense_cython_scaled(kkt_matrix_scaled, kkt_rhs_scaled,
     except:
         raise RuntimeError("All Cython LSSVR solvers failed - this should not happen")
 
-def solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma):
+def solve_lssvr_system_reduced_normal(A, C, b_pde, b_bc, M, gamma):
+    """
+    FASTEST: Direct solution via reduced normal equations (avoids KKT system entirely).
+    
+    Instead of solving the full KKT system, we eliminate the Lagrange multipliers analytically.
+    This reduces the problem to solving a single symmetric positive definite system.
+    
+    Theory: From KKT optimality conditions, we can derive:
+        w = (A^T A + γ^{-1} I)^{-1} (A^T b_pde + γ^{-1} C^T (C (A^T A + γ^{-1} I)^{-1} C^T)^{-1} (b_bc - C (A^T A + γ^{-1} I)^{-1} A^T b_pde))
+    
+    But a simpler approach: Solve constrained least squares directly using QR factorization of C.
+    """
+    # Method 1: Use null space of constraints for unconstrained subproblem
+    # For small 2 BC constraints, explicit formula is fastest
+    
+    # Pre-compute
+    ATA = A.T @ A
+    ATb = A.T @ b_pde
+    
+    # Build regularized normal matrix: N = I + γA^TA
+    N = np.eye(M, dtype=np.float64) + gamma * ATA
+    g = gamma * ATb
+    
+    # For the constrained problem: min 0.5*w^T N w - g^T w  s.t. Cw = h
+    # Solution: w = N^{-1}(g + C^T λ) where λ solves (C N^{-1} C^T) λ = h - C N^{-1} g
+    
+    try:
+        # Cholesky factorization of N
+        N_factor = cho_factor(N, lower=False)
+        
+        # Compute N^{-1} C^T and N^{-1} g
+        N_inv_CT = cho_solve(N_factor, C.T)
+        N_inv_g = cho_solve(N_factor, g)
+        
+        # Schur complement: S = C N^{-1} C^T (2x2 matrix)
+        S = C @ N_inv_CT
+        
+        # RHS for Lagrange multipliers: h - C N^{-1} g
+        rhs_lambda = b_bc - C @ N_inv_g
+        
+        # Solve for Lagrange multipliers (2x2 system)
+        lambda_ = np.linalg.solve(S, rhs_lambda)
+        
+        # Back-substitute: w = N^{-1}(g + C^T λ)
+        w = N_inv_g + N_inv_CT @ lambda_
+        
+        solution = np.concatenate([w, lambda_])
+        return solution, "reduced_normal"
+        
+    except np.linalg.LinAlgError as e:
+        print(f"Reduced normal equation failed: {e}, using Schur complement fallback")
+        return solve_lssvr_system_dense_python_schur(A, C, b_pde, b_bc, M, gamma)
+
+def solve_lssvr_batch_optimized(A, C, b_pde_batch, b_bc_batch, M, gamma):
+    """
+    MOST EFFICIENT: Batch solver that reuses factorization across all elements.
+    
+    For uniform meshes, A and C matrices are IDENTICAL for all elements.
+    We can factorize ONCE and solve for all RHS simultaneously.
+    
+    Args:
+        A: Constraint matrix (n_points × M) - SAME for all elements
+        C: Boundary matrix (2 × M) - SAME for all elements
+        b_pde_batch: RHS for PDE (batch_size × n_points)
+        b_bc_batch: RHS for BC (batch_size × 2)
+        M: Number of Legendre coefficients
+        gamma: Regularization parameter
+    
+    Returns:
+        solutions: (batch_size × (M+2)) array of solutions
+        method: Solver method used
+    """
+    batch_size = b_pde_batch.shape[0]
+    
+    # Pre-compute matrices ONCE for entire batch
+    ATA = A.T @ A
+    N = np.eye(M, dtype=np.float64) + gamma * ATA
+    
+    try:
+        # Single Cholesky factorization for all elements
+        N_factor = cho_factor(N, lower=False)
+        
+        # Pre-compute N^{-1} C^T once
+        N_inv_CT = cho_solve(N_factor, C.T)
+        
+        # Schur complement S = C N^{-1} C^T (same for all elements)
+        S = C @ N_inv_CT
+        
+        # Solve for all elements in batch
+        solutions = np.zeros((batch_size, M + 2))
+        
+        for i in range(batch_size):
+            # Compute element-specific RHS
+            ATb = A.T @ b_pde_batch[i, :]
+            g = gamma * ATb
+            
+            # Solve using pre-computed factorization
+            N_inv_g = cho_solve(N_factor, g)
+            rhs_lambda = b_bc_batch[i, :] - C @ N_inv_g
+            lambda_ = np.linalg.solve(S, rhs_lambda)
+            w = N_inv_g + N_inv_CT @ lambda_
+            
+            solutions[i, :M] = w
+            solutions[i, M:] = lambda_
+        
+        return solutions, "batch_optimized"
+        
+    except np.linalg.LinAlgError as e:
+        print(f"Batch solver failed: {e}, falling back to element-wise")
+        # Fallback: solve each element individually
+        solutions = np.zeros((batch_size, M + 2))
+        for i in range(batch_size):
+            sol, _ = solve_lssvr_system_reduced_normal(A, C, b_pde_batch[i, :], b_bc_batch[i, :], M, gamma)
+            solutions[i, :] = sol
+        return solutions, "batch_fallback"
+
+def solve_lssvr_system_dense_python_schur(A, C, b_pde, b_bc, M, gamma):
     """
     Optimized dense LSSVR solver using Cholesky factorization + Schur complement.
     
@@ -851,6 +967,9 @@ def solve_lssvr_system_dense_python(A, C, b_pde, b_bc, M, gamma):
         # Fallback to original method if Cholesky fails (shouldn't happen for well-posed problems)
         print(f"Cholesky factorization failed: {e}, using fallback solver")
         return solve_lssvr_system_dense_python_fallback(A, C, b_pde, b_bc, M, gamma)
+
+# Alias for backward compatibility
+solve_lssvr_system_dense_python = solve_lssvr_system_reduced_normal
 
 def solve_lssvr_system_dense_python_fallback(A, C, b_pde, b_bc, M, gamma):
     """
@@ -1421,46 +1540,85 @@ class FEMLSSVRPrimalSolver:
             else:
                 b_bc_batch[i, 1] = u_rights[i]
         
-        # Solve each element (KKT solving is harder to vectorize due to different domains)
-        for i in range(batch_size):
-            domain_range = [x_starts[i], x_ends[i]]
+        # KEY OPTIMIZATION: For uniform meshes, all elements have SAME A, C matrices!
+        # Check if all elements have same size (uniform mesh)
+        element_sizes = x_ends - x_starts
+        is_uniform = np.allclose(element_sizes, element_sizes[0], rtol=1e-10)
+        
+        if is_uniform:
+            # FAST PATH: Build matrices ONCE, solve batch simultaneously
+            domain_range = [x_starts[0], x_ends[0]]
             
-            # Build constraint matrices using optimized operations
-            if USE_CYTHON and self.lssvr_M <= 8:
+            # Build constraint matrices ONCE for entire batch
+            if USE_CYTHON and self.lssvr_M <= 13:
                 A, C = build_legendre_matrices_cython(
-                    self.lssvr_M, training_points_batch[i, :], 
-                    x_starts[i], x_ends[i], domain_range
+                    self.lssvr_M, training_points_batch[0, :], 
+                    x_starts[0], x_ends[0], domain_range
                 )
             elif USE_VECTORIZED:
                 A, C = build_legendre_matrices_vectorized(
-                    self.lssvr_M, training_points_batch[i, :], 
-                    x_starts[i], x_ends[i], domain_range
+                    self.lssvr_M, training_points_batch[0, :], 
+                    x_starts[0], x_ends[0], domain_range
                 )
             else:
                 A, C = build_legendre_matrices_jit(
-                    self.lssvr_M, training_points_batch[i, :], 
-                    x_starts[i], x_ends[i], domain_range
+                    self.lssvr_M, training_points_batch[0, :], 
+                    x_starts[0], x_ends[0], domain_range
                 )
             
-            # Solve KKT system for this element
-            try:
-                solution, method_used = solve_lssvr_system(
-                    A, C, f_vals_batch[i, :], b_bc_batch[i, :], 
-                    self.lssvr_M, self.lssvr_gamma
-                )
-                
-                w = solution[:self.lssvr_M]
-                
-                # Create Legendre polynomial approximation
-                u_lssvr = Legendre(w, domain_range)
+            # Solve entire batch with one factorization
+            solutions, method_used = solve_lssvr_batch_optimized(
+                A, C, f_vals_batch, b_bc_batch, self.lssvr_M, self.lssvr_gamma
+            )
+            
+            # Create Legendre polynomials from batch solutions
+            for i in range(batch_size):
+                w = solutions[i, :self.lssvr_M]
+                domain_range_i = [x_starts[i], x_ends[i]]
+                u_lssvr = Legendre(w, domain_range_i)
                 batch_functions.append(u_lssvr)
                 
-            except Exception as e:
-                print(f"Batch element {i} failed: {e}")
-                # Fallback to linear interpolation
-                def linear_fallback(x):
-                    return u_lefts[i] + (u_rights[i] - u_lefts[i]) * (x - x_starts[i]) / (x_ends[i] - x_starts[i])
-                batch_functions.append(linear_fallback)
+        else:
+            # SLOW PATH: Non-uniform mesh, solve each element individually
+            for i in range(batch_size):
+                domain_range = [x_starts[i], x_ends[i]]
+                
+                # Build constraint matrices using optimized operations
+                if USE_CYTHON and self.lssvr_M <= 13:
+                    A, C = build_legendre_matrices_cython(
+                        self.lssvr_M, training_points_batch[i, :], 
+                        x_starts[i], x_ends[i], domain_range
+                    )
+                elif USE_VECTORIZED:
+                    A, C = build_legendre_matrices_vectorized(
+                        self.lssvr_M, training_points_batch[i, :], 
+                        x_starts[i], x_ends[i], domain_range
+                    )
+                else:
+                    A, C = build_legendre_matrices_jit(
+                        self.lssvr_M, training_points_batch[i, :], 
+                        x_starts[i], x_ends[i], domain_range
+                    )
+                
+                # Solve KKT system for this element
+                try:
+                    solution, method_used = solve_lssvr_system(
+                        A, C, f_vals_batch[i, :], b_bc_batch[i, :], 
+                        self.lssvr_M, self.lssvr_gamma
+                    )
+                    
+                    w = solution[:self.lssvr_M]
+                    
+                    # Create Legendre polynomial approximation
+                    u_lssvr = Legendre(w, domain_range)
+                    batch_functions.append(u_lssvr)
+                    
+                except Exception as e:
+                    print(f"Batch element {i} failed: {e}")
+                    # Fallback to linear interpolation
+                    def linear_fallback(x):
+                        return u_lefts[i] + (u_rights[i] - u_lefts[i]) * (x - x_starts[i]) / (x_ends[i] - x_starts[i])
+                    batch_functions.append(linear_fallback)
         
         return batch_functions
     
