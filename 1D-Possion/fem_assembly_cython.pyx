@@ -361,7 +361,8 @@ cdef class FastLegendrePolynomial:
 @cython.wraparound(False)
 def create_fast_legendre_polynomials_batch(double[:, :] solutions, double[:] x_starts, double[:] x_ends, int M):
     """
-    Create list of FastLegendrePolynomial objects for entire batch.
+    Create list of FastLegendrePolynomial objects for entire batch (optimized).
+    Pre-allocates list for better memory efficiency.
     
     Args:
         solutions: (batch_size, M+2) array of LSSVR solutions
@@ -374,44 +375,10 @@ def create_fast_legendre_polynomials_batch(double[:, :] solutions, double[:] x_s
     """
     cdef int batch_size = solutions.shape[0]
     cdef int i
-    cdef list polynomials = []
+    cdef list polynomials = [None] * batch_size  # Pre-allocate list - avoids repeated reallocation
     
     for i in range(batch_size):
-        # Extract coefficients for this element
-        w = solutions[i, :M]
-        domain = (x_starts[i], x_ends[i])
-        
-        # Create polynomial object
-        poly = FastLegendrePolynomial(w, domain)
-        polynomials.append(poly)
-    
-    return polynomials
-
-
-def create_fast_legendre_polynomials_batch(double[:, :] solutions, double[:] x_starts, double[:] x_ends, int M):
-    """
-    Create list of FastLegendrePolynomial objects for entire batch.
-    
-    Args:
-        solutions: (batch_size, M+2) array of LSSVR solutions
-        x_starts: (batch_size,) array of element start coordinates  
-        x_ends: (batch_size,) array of element end coordinates
-        M: Number of Legendre coefficients
-    
-    Returns:
-        List of FastLegendrePolynomial objects
-    """
-    cdef int batch_size = solutions.shape[0]
-    cdef int i
-    cdef list polynomials = []
-    
-    for i in range(batch_size):
-        # Extract coefficients for this element
-        w = solutions[i, :M]
-        domain = (x_starts[i], x_ends[i])
-        
-        # Create polynomial object
-        poly = FastLegendrePolynomial(w, domain)
-        polynomials.append(poly)
+        # Use memoryview slice directly - very fast, no copy
+        polynomials[i] = FastLegendrePolynomial(solutions[i, :M], (x_starts[i], x_ends[i]))
     
     return polynomials

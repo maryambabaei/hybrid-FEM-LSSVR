@@ -1863,8 +1863,8 @@ class FEMLSSVRPrimalSolver:
         element_times = []
         
         # Adaptive strategy: Use parallel processing for very large systems
-        # Threshold increased to 2M elements to avoid overhead
-        use_parallel = n_elements > 2000000
+        # Threshold increased to 10M elements to avoid overhead
+        use_parallel = n_elements > 10000000
         n_workers = max(2, min(cpu_count() - 1, 8)) if use_parallel else 1
         
         # SIMD batch processing parameters - optimized for modern CPUs
@@ -2226,18 +2226,18 @@ class FEMLSSVRPrimalSolver:
 
     
     def evaluate_solution(self, x_points):
-        """Evaluate the hybrid solution at given points."""
+        """Evaluate the hybrid solution at given points (vectorized)."""
         solution = np.zeros_like(x_points)
         
         # Find element indices for all points
         element_indices = np.searchsorted(self.fem_nodes, x_points, side='right') - 1
         element_indices = np.clip(element_indices, 0, len(self.lssvr_functions) - 1)
         
-        # Evaluate for each element
-        for j in range(len(self.lssvr_functions)):
+        # Vectorized evaluation: only process unique elements that have points
+        unique_elements = np.unique(element_indices)
+        for j in unique_elements:
             mask = (element_indices == j)
-            if np.any(mask):
-                solution[mask] = self.lssvr_functions[j](x_points[mask])
+            solution[mask] = self.lssvr_functions[j](x_points[mask])
         
         return solution
 
