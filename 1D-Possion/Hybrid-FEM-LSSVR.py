@@ -23,6 +23,20 @@ except ImportError:
     USE_CYTHON = False
     print("Cython extension not available, using optimized Python version")
 
+# Try to import FEM Cython acceleration
+try:
+    from fem_assembly_cython import (
+        assemble_fem_1d_cython,
+        enforce_dirichlet_bc_cython,
+        interpolate_solution_cython,
+        poisson_rhs_vectorized  # Fast C implementation for RHS evaluation
+    )
+    USE_FEM_CYTHON = True
+    print("FEM Cython acceleration available and enabled")
+except ImportError:
+    USE_FEM_CYTHON = False
+    print("FEM Cython not available, using skfem")
+
 # Try to import advanced Cython optimizations
 try:
     import sys
@@ -134,18 +148,24 @@ def main_boundary_condition_left(x):
 def main_boundary_condition_right(x):
     return 0.0  # u(1) = 0
 
-@jit(nopython=True, cache=True, fastmath=True)
-def poisson_rhs_batch(x_array, n=8):
-    """
-    Vectorized RHS evaluation with Numba optimization.
-    For small arrays, serial execution is faster than parallel.
-    """
-    result = np.empty_like(x_array)
-    n_pi = n * np.pi
-    n_pi_sq = n_pi * n_pi
-    for i in range(len(x_array)):
-        result[i] = n_pi_sq * np.sin(n_pi * x_array[i])
-    return result
+# Dual implementation: Use Cython if available, fallback to Numba
+if USE_FEM_CYTHON:
+    # Use fast C implementation from Cython
+    def poisson_rhs_batch(x_array, n=8):
+        """Wrapper for Cython RHS - ultra-fast C implementation."""
+        return poisson_rhs_vectorized(x_array, n)
+else:
+    # Fallback to Numba JIT
+    @jit(nopython=True, cache=True, fastmath=True)
+    def poisson_rhs_batch(x_array, n=8):
+        """
+        Vectorized RHS evaluation with Numba optimization.
+        Fully vectorized - computes all values at once.
+        """
+        n_pi = n * np.pi
+        n_pi_sq = n_pi * n_pi
+        # Vectorized computation - no loop needed!
+        return n_pi_sq * np.sin(n_pi * x_array)
 
 @jit(nopython=True, cache=True)
 def evaluate_legendre_deriv2(coeffs, points, domain):
@@ -1556,40 +1576,82 @@ class FEMLSSVRPrimalSolver:
         fem_start = time.time()
         monitor.memory_usage.append(monitor.get_memory_usage())
         
-        # Create mesh and basis
-        m = MeshLine(np.linspace(self.global_domain[0], self.global_domain[1], self.num_fem_nodes))
-        element_p = ElementLineP1()
-        basis = Basis(m, element_p)
-        
-        # Define bilinear and linear forms
-        @BilinearForm
-        def laplace(u, v, _):
-            return dot(grad(u), grad(v))
-        
-        @LinearForm
-        def load(v, w):
-            x = w.x[0]
-            return poisson_rhs(x, self.solution_order) * v
-                
-        # Assemble and solve
-        A = laplace.assemble(basis)
-        b = load.assemble(basis)
-        A, b = enforce(A, b, D=basis.get_dofs())
-        u_fem = solve(A, b)
+        if USE_FEM_CYTHON:
+            # Fast Cython-based FEM assembly
+            nodes = np.linspace(self.global_domain[0], self.global_domain[1], self.num_fem_nodes)
+            
+            # Assemble system
+            data, rows, cols, b = assemble_fem_1d_cython(nodes, self.solution_order)
+            
+            # Build sparse matrix
+            from scipy.sparse import coo_matrix
+            A_sparse = coo_matrix((data, (rows, cols)), shape=(self.num_fem_nodes, self.num_fem_nodes))
+            A_sparse = A_sparse.tocsr()  # Convert to CSR for efficient solving
+            
+            # Enforce boundary conditions (Dirichlet at both ends)
+            # For 1D: first and last nodes are boundary
+            boundary_dofs = np.array([0, self.num_fem_nodes - 1], dtype=np.int32)
+            
+            # Modify matrix: set boundary rows to identity
+            for dof in boundary_dofs:
+                A_sparse.data[A_sparse.indptr[dof]:A_sparse.indptr[dof+1]] = 0
+                A_sparse[dof, dof] = 1.0
+                b[dof] = 0.0  # Homogeneous BC
+            
+            # Eliminate boundary columns from RHS
+            A_sparse.eliminate_zeros()
+            
+            # Solve sparse system
+            from scipy.sparse.linalg import spsolve
+            u_fem = spsolve(A_sparse, b)
+            
+            # Store solution
+            self.fem_nodes = nodes
+            self.fem_values = u_fem
+            
+        else:
+            # Original skfem implementation
+            # Create mesh and basis
+            m = MeshLine(np.linspace(self.global_domain[0], self.global_domain[1], self.num_fem_nodes))
+            element_p = ElementLineP1()
+            basis = Basis(m, element_p)
+            
+            # Define bilinear and linear forms
+            @BilinearForm
+            def laplace(u, v, _):
+                return dot(grad(u), grad(v))
+            
+            @LinearForm
+            def load(v, w):
+                x = w.x[0]
+                return poisson_rhs(x, self.solution_order) * v
+                    
+            # Assemble and solve
+            A = laplace.assemble(basis)
+            b = load.assemble(basis)
+            A, b = enforce(A, b, D=basis.get_dofs())
+            u_fem = solve(A, b)
+            
+            # Get node values
+            interpolator = basis.interpolator(u_fem)
+            self.fem_nodes = m.p[0]
+            self.fem_values = interpolator(self.fem_nodes.reshape(1, -1)).flatten()
         
         fem_time = time.time() - fem_start
         monitor.fem_time = fem_time
         monitor.record_operation('FEM_solve', fem_time, f'nodes={self.num_fem_nodes}')
         monitor.memory_usage.append(monitor.get_memory_usage())
         
-        # Get node values
-        interpolator = basis.interpolator(u_fem)
-        self.fem_nodes = m.p[0]
-        self.fem_values = interpolator(self.fem_nodes.reshape(1, -1)).flatten()
-        
         # Compute FEM error for reference
         test_points_fem = np.linspace(self.global_domain[0], self.global_domain[1], 201)
-        fem_solution_at_test = interpolator(test_points_fem.reshape(1, -1)).flatten()
+        
+        if USE_FEM_CYTHON:
+            # Use Cython interpolation
+            fem_solution_at_test = interpolate_solution_cython(self.fem_nodes, self.fem_values, test_points_fem)
+        else:
+            # Use skfem interpolation
+            fem_solution_at_test = interpolator(test_points_fem.reshape(1, -1)).flatten()
+        
         exact_at_test = true_solution(test_points_fem, self.solution_order)
         fem_error = np.abs(fem_solution_at_test - exact_at_test)
         fem_max_error = np.max(fem_error)
@@ -1597,7 +1659,10 @@ class FEMLSSVRPrimalSolver:
         print(f"FEM Max error: {fem_max_error:.6e}")
         print(f"FEM L2 error: {fem_l2_error:.6e}")
         
-        return u_fem, basis
+        if USE_FEM_CYTHON:
+            return self.fem_values, None
+        else:
+            return u_fem, basis
     
     def solve_lssvr_subproblems(self):
         """Solve LSSVR with primal method in each element using SIMD batch processing.
@@ -1695,9 +1760,26 @@ class FEMLSSVRPrimalSolver:
         monitor.record_operation('LSSVR_subproblems', lssvr_time, f'elements={len(self.lssvr_functions)}')
         monitor.memory_usage.append(monitor.get_memory_usage())
 
+        # Print detailed timing breakdown
+        if hasattr(self, '_timing_breakdown'):
+            total_accounted = sum(self._timing_breakdown.values())
+            overhead = lssvr_time - total_accounted
+            self._timing_breakdown['other'] = overhead
+            
+            print(f"\n{'='*80}")
+            print(f"LSSVR TIMING BREAKDOWN ({len(element_times)} elements):")
+            print(f"{'='*80}")
+            print(f"  Solving systems:    {self._timing_breakdown['solve']*1000:7.2f} ms ({self._timing_breakdown['solve']/lssvr_time*100:5.1f}%)")
+            print(f"  Creating polynomials: {self._timing_breakdown['poly']*1000:7.2f} ms ({self._timing_breakdown['poly']/lssvr_time*100:5.1f}%)")
+            print(f"  RHS evaluation:     {self._timing_breakdown['rhs']*1000:7.2f} ms ({self._timing_breakdown['rhs']/lssvr_time*100:5.1f}%)")
+            print(f"  Other overhead:     {self._timing_breakdown['other']*1000:7.2f} ms ({self._timing_breakdown['other']/lssvr_time*100:5.1f}%)")
+            print(f"  {'─'*78}")
+            print(f"  TOTAL LSSVR time:   {lssvr_time*1000:7.2f} ms (100.0%)")
+            print(f"{'='*80}\n")
+        
         # Print element timing summary
         if element_times:
-            print(f"\nElement timing summary:")
+            print(f"Element timing summary:")
             print(f"  Average element time: {np.mean(element_times):.6f}s")
             print(f"  Min element time: {np.min(element_times):.6f}s")
             print(f"  Max element time: {np.max(element_times):.6f}s")
@@ -1747,11 +1829,15 @@ class FEMLSSVRPrimalSolver:
                 h = x_ends[i] - x_starts[i]
                 all_x_points[i, :] = x_starts[i] + (x_ends[i] - x_starts[i]) * (xi_points + 1.0) / 2.0
             
-            # Vectorized RHS evaluation (JIT-compiled, parallel)
-            for i in range(batch_size):
-                f_vals_batch[i, :] = poisson_rhs_batch(all_x_points[i, :], self.solution_order)
+            # FULLY Vectorized RHS evaluation - evaluate ALL points at once!
+            t_rhs = time.perf_counter()
+            # Flatten to 1D array, evaluate, then reshape back
+            all_f_vals = poisson_rhs_batch(all_x_points.ravel(), self.solution_order)
+            f_vals_batch[:, :] = all_f_vals.reshape(batch_size, n_training_per_element)
+            rhs_time = time.perf_counter() - t_rhs
                 
-                # Boundary conditions
+            # Boundary conditions
+            for i in range(batch_size):
                 if is_left_boundaries[i] and x_starts[i] == self.global_domain[0]:
                     b_bc_batch[i, 0] = main_boundary_condition_left(self.global_domain[0])
                 else:
@@ -1769,16 +1855,27 @@ class FEMLSSVRPrimalSolver:
             C = C_ref  # Unchanged for Legendre polynomials
             
             # Solve entire batch with one factorization
+            t_solve = time.perf_counter()
             solutions, method_used = solve_lssvr_batch_optimized(
                 A, C, f_vals_batch, b_bc_batch, self.lssvr_M, self.lssvr_gamma
             )
+            solve_time = time.perf_counter() - t_solve
             
             # Create Legendre polynomials from batch solutions
+            t_poly = time.perf_counter()
             for i in range(batch_size):
                 w = solutions[i, :self.lssvr_M]
                 domain_range_i = [x_starts[i], x_ends[i]]
                 u_lssvr = Legendre(w, domain_range_i)
                 batch_functions.append(u_lssvr)
+            poly_time = time.perf_counter() - t_poly
+            
+            # Track timing breakdown
+            if not hasattr(self, '_timing_breakdown'):
+                self._timing_breakdown = {'solve': 0.0, 'poly': 0.0, 'rhs': 0.0, 'other': 0.0}
+            self._timing_breakdown['solve'] += solve_time
+            self._timing_breakdown['poly'] += poly_time
+            self._timing_breakdown['rhs'] += rhs_time
                 
         else:
             # NON-UNIFORM PATH: Different element sizes require individual treatment
@@ -1813,8 +1910,13 @@ class FEMLSSVRPrimalSolver:
                     b_bc_batch[i, 1] = main_boundary_condition_right(self.global_domain[1])
                 else:
                     b_bc_batch[i, 1] = u_rights[i]
-                
+            
+            # Solve and create polynomials for non-uniform batch
+            t_solve = time.perf_counter()
+            t_poly_total = 0.0
+            for i in range(batch_size):
                 # Scale A matrix by element-specific Jacobian
+                h = x_ends[i] - x_starts[i]
                 inv_jac_sq = (2.0 / h) ** 2
                 A = A_ref * inv_jac_sq
                 C = C_ref
@@ -1825,10 +1927,21 @@ class FEMLSSVRPrimalSolver:
                     self.lssvr_M, self.lssvr_gamma
                 )
                 
+                t_p = time.perf_counter()
                 w = solution[:self.lssvr_M]
                 domain_range_i = [x_starts[i], x_ends[i]]
                 u_lssvr = Legendre(w, domain_range_i)
                 batch_functions.append(u_lssvr)
+                t_poly_total += time.perf_counter() - t_p
+            
+            solve_time = time.perf_counter() - t_solve - t_poly_total
+            
+            # Track timing breakdown
+            if not hasattr(self, '_timing_breakdown'):
+                self._timing_breakdown = {'solve': 0.0, 'poly': 0.0, 'rhs': 0.0, 'other': 0.0}
+            self._timing_breakdown['solve'] += solve_time
+            self._timing_breakdown['poly'] += t_poly_total
+            self._timing_breakdown['rhs'] += rhs_time
         
         return batch_functions
     
