@@ -1,6 +1,6 @@
-## hybrid-FEM-LSSVR
+## Higher-resolution-LSSVR
 
-This repository contains the implementation of the hybrid Finite Element Method (FEM) and Least Squares Support Vector Regression (LSSVR) approach for solving the 1D Poisson equation.
+This repository presents a LSSVR approach for super-resolution of elliptic PDE solutions. A coarse solution is first computed using the Finite Element Method, then Least Squares Support Vector Regression is used to reconstruct a higher-resolution solution from the low-resolution data. The approach is demonstrated on one-dimensional elliptic problems, including the Poisson equation.
 
 ### Problem Description
 
